@@ -1,0 +1,119 @@
+From 10676dd0b8463750615a7d52115274fd047b0b9d Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <shuhao_zhang@hust.edu.cn>
+Date: Thu, 23 Jul 2026 16:43:52 +0800
+Subject: [PATCH] ci(ascend): serialize PR jobs on dedicated NPU
+
+---
+ .github/actionlint.yaml                            |  1 +
+ .github/workflows/ascend-benchmark-leaderboard.yml |  2 +-
+ .../linux-ascend-inference-regression.yml          |  1 +
+ .github/workflows/linux-ascend-inference-smoke.yml |  1 +
+ tests/ci/test_ascend_benchmark_workflow_static.py  | 14 +++++++++++---
+ tests/ci/test_ci_trigger_policy_static.py          | 10 +++++++++-
+ 6 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/.github/actionlint.yaml b/.github/actionlint.yaml
+index 16a7f609b..7914a695b 100644
+--- a/.github/actionlint.yaml
++++ b/.github/actionlint.yaml
+@@ -6,5 +6,6 @@ self-hosted-runner:
+     - ascend
+     - 910b
+     - docker
++    - npu-2
+     # Not yet in actionlint's known-label set.
+     - macos-26
+diff --git a/.github/workflows/ascend-benchmark-leaderboard.yml b/.github/workflows/ascend-benchmark-leaderboard.yml
+index 347285382..50c17b455 100644
+--- a/.github/workflows/ascend-benchmark-leaderboard.yml
++++ b/.github/workflows/ascend-benchmark-leaderboard.yml
+@@ -263,7 +263,7 @@ jobs:
+       - ascend
+       - 910b
+       - docker
+-      - ${{ github.event_name == 'workflow_dispatch' && (vars.VLLM_HUST_MANUAL_RUNNER_LABEL || 'npu-1') || 'ascend-benchmark' }}
++      - ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'npu-2' || (github.event_name == 'workflow_dispatch' && (vars.VLLM_HUST_MANUAL_RUNNER_LABEL || 'npu-1') || 'ascend-benchmark') }}
+     timeout-minutes: 60
+     env:
+       HOME: ${{ github.workspace }}/.ci-home
+diff --git a/.github/workflows/linux-ascend-inference-regression.yml b/.github/workflows/linux-ascend-inference-regression.yml
+index 9ee69a61a..4e0a5760f 100644
+--- a/.github/workflows/linux-ascend-inference-regression.yml
++++ b/.github/workflows/linux-ascend-inference-regression.yml
+@@ -28,6 +28,7 @@ jobs:
+       - ascend
+       - 910b
+       - docker
++      - ${{ github.event_name == 'pull_request' && 'npu-2' || 'ascend-benchmark' }}
+     timeout-minutes: 45
+     env:
+       DEFAULT_SYSTEM_ASCEND_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
+diff --git a/.github/workflows/linux-ascend-inference-smoke.yml b/.github/workflows/linux-ascend-inference-smoke.yml
+index 116911fc1..35a954b5a 100644
+--- a/.github/workflows/linux-ascend-inference-smoke.yml
++++ b/.github/workflows/linux-ascend-inference-smoke.yml
+@@ -30,6 +30,7 @@ jobs:
+       - ascend
+       - 910b
+       - docker
++      - ${{ github.event_name == 'pull_request' && 'npu-2' || 'ascend-benchmark' }}
+     timeout-minutes: 30
+     env:
+       DEFAULT_SYSTEM_ASCEND_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
+diff --git a/tests/ci/test_ascend_benchmark_workflow_static.py b/tests/ci/test_ascend_benchmark_workflow_static.py
+index 2d8f4ac81..c2b890cbb 100644
+--- a/tests/ci/test_ascend_benchmark_workflow_static.py
++++ b/tests/ci/test_ascend_benchmark_workflow_static.py
+@@ -464,13 +464,21 @@ def test_workflow_dispatch_metadata_lengths_are_parsed_from_single_input():
+     assert "inputs.output_length" not in text
+ 
+ 
++def test_pr_and_comment_runs_target_dedicated_npu_two():
++    text = workflow_text()
++
++    assert (
++        "(github.event_name == 'pull_request' || "
++        "github.event_name == 'issue_comment') && 'npu-2'"
++    ) in text
++
++
+ def test_workflow_dispatch_targets_manual_runner_pool():
+     text = workflow_text()
+ 
+     assert (
+-        "${{ github.event_name == 'workflow_dispatch' && "
+-        "(vars.VLLM_HUST_MANUAL_RUNNER_LABEL || 'npu-1') || "
+-        "'ascend-benchmark' }}"
++        "github.event_name == 'workflow_dispatch' && "
++        "(vars.VLLM_HUST_MANUAL_RUNNER_LABEL || 'npu-1')"
+     ) in text
+ 
+ 
+diff --git a/tests/ci/test_ci_trigger_policy_static.py b/tests/ci/test_ci_trigger_policy_static.py
+index 944342036..1b691ee0f 100644
+--- a/tests/ci/test_ci_trigger_policy_static.py
++++ b/tests/ci/test_ci_trigger_policy_static.py
+@@ -39,6 +39,14 @@ def test_npu_pr_workflows_gate_on_current_labels_not_label_event():
+         assert "github.event.label.name" not in text
+ 
+ 
++def test_npu_pr_workflows_target_dedicated_npu_two():
++    for workflow_path in NPU_WORKFLOWS:
++        text = workflow_path.read_text(encoding="utf-8")
++
++        assert "github.event_name == 'pull_request'" in text
++        assert "'npu-2'" in text
++
++
+ def test_pre_commit_uses_available_github_hosted_runner():
+     workflow_path = REPO_ROOT / ".github/workflows/pre-commit.yml"
+     workflow = load_workflow(workflow_path)
+@@ -76,4 +84,4 @@ def test_actionlint_knows_ascend_runner_labels():
+     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+     labels = set(config["self-hosted-runner"]["labels"])
+ 
+-    assert {"ascend", "910b", "docker"} <= labels
++    assert {"ascend", "910b", "docker", "npu-2"} <= labels
+-- 
+2.53.0.windows.3
+

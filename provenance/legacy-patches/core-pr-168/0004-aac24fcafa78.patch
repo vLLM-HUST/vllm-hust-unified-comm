@@ -1,0 +1,601 @@
+From 2f362c6c01e7f6211af4e6f1cabec0c14d6eaff8 Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <5267690+ShuhaoZhangTony@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 19:02:40 +0800
+Subject: [PATCH] fix(unified_comm): harden multi-NIC selection
+
+Restrict auto-discovery to valid InfiniBand HCA names, preserve explicit NCCL selections, validate numeric tuning inputs, and cover environment/topology behavior with CPU unit tests.
+
+Co-authored-by: Codex <codex@openai.com>
+
+Signed-off-by: Shuhao Zhang (Tony) <5267690+ShuhaoZhangTony@users.noreply.github.com>
+---
+ .../test_unified_comm_multi_nic.py            | 108 +++++++++
+ vllm/distributed/unified_comm/README.md       |   1 -
+ .../unified_comm/backends/nccl_backend.py     | 225 ++++--------------
+ vllm/distributed/unified_comm/collective.py   |  38 +--
+ 4 files changed, 180 insertions(+), 192 deletions(-)
+ create mode 100644 tests/distributed/test_unified_comm_multi_nic.py
+
+diff --git a/tests/distributed/test_unified_comm_multi_nic.py b/tests/distributed/test_unified_comm_multi_nic.py
+new file mode 100644
+index 000000000..c1084b139
+--- /dev/null
++++ b/tests/distributed/test_unified_comm_multi_nic.py
+@@ -0,0 +1,108 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import os
++from pathlib import Path
++
++from vllm.distributed.unified_comm.backend import CommConfig
++from vllm.distributed.unified_comm.backends.nccl_backend import NCCLBackend
++from vllm.distributed.unified_comm.collective import CollectiveGroup
++
++MULTI_NIC_ENV_VARS = (
++    "NCCL_CROSS_NIC",
++    "NCCL_IB_HCA",
++    "NCCL_IB_QPS_PER_CONNECTION",
++    "UNIFIED_COMM_NCCL_MULTI_NIC_COUNT",
++    "UNIFIED_COMM_NCCL_MULTI_NIC_DEVICES",
++    "UNIFIED_COMM_NCCL_MULTI_NIC_ENABLE",
++    "UNIFIED_COMM_NCCL_MULTI_NIC_FORCE",
++    "UNIFIED_COMM_NCCL_MULTI_NIC_QPS_PER_CONNECTION",
++)
++
++
++def _clear_multi_nic_env(monkeypatch) -> None:
++    for name in MULTI_NIC_ENV_VARS:
++        monkeypatch.delenv(name, raising=False)
++
++
++def test_multi_nic_explicit_devices_are_normalized_and_limited(monkeypatch) -> None:
++    _clear_multi_nic_env(monkeypatch)
++    backend = NCCLBackend()
++    config = CommConfig(
++        extra={
++            "multi_nic_devices": " mlx5_2,mlx5_0, mlx5_1 ",
++            "multi_nic_count": 2,
++        }
++    )
++
++    backend._maybe_enable_multi_nic_aggregation(config)
++
++    assert os.environ["NCCL_IB_HCA"] == "mlx5_2,mlx5_0"
++    assert os.environ["NCCL_CROSS_NIC"] == "1"
++    assert os.environ["NCCL_IB_QPS_PER_CONNECTION"] == "4"
++
++
++def test_multi_nic_preserves_existing_nccl_selection(monkeypatch) -> None:
++    _clear_multi_nic_env(monkeypatch)
++    monkeypatch.setenv("NCCL_IB_HCA", "=mlx5_7:1")
++
++    NCCLBackend()._maybe_enable_multi_nic_aggregation(
++        CommConfig(extra={"multi_nic_devices": "mlx5_0,mlx5_1"})
++    )
++
++    assert os.environ["NCCL_IB_HCA"] == "=mlx5_7:1"
++    assert "NCCL_CROSS_NIC" not in os.environ
++
++
++def test_multi_nic_force_override_and_invalid_numeric_values(monkeypatch) -> None:
++    _clear_multi_nic_env(monkeypatch)
++    monkeypatch.setenv("NCCL_IB_HCA", "mlx5_old")
++    config = CommConfig(
++        extra={
++            "multi_nic_devices": [f"mlx5_{index}" for index in range(10)],
++            "multi_nic_force": True,
++            "multi_nic_count": "invalid",
++            "multi_nic_qps_per_connection": "invalid",
++        }
++    )
++
++    NCCLBackend()._maybe_enable_multi_nic_aggregation(config)
++
++    assert os.environ["NCCL_IB_HCA"] == ",".join(f"mlx5_{index}" for index in range(8))
++    assert os.environ["NCCL_IB_QPS_PER_CONNECTION"] == "4"
++
++
++def test_discover_rdma_hcas_uses_infiniband_device_names(tmp_path: Path) -> None:
++    for name in ("mlx5_2", "mlx5_bond_0", "mlx5_0"):
++        (tmp_path / name).mkdir()
++    (tmp_path / "not-a-device").write_text("", encoding="utf-8")
++
++    assert NCCLBackend()._discover_rdma_hcas(tmp_path) == [
++        "mlx5_bond_0",
++        "mlx5_0",
++        "mlx5_2",
++    ]
++
++
++def test_topology_nic_detection_parses_exact_hcas_and_ports(
++    monkeypatch, tmp_path: Path
++) -> None:
++    monkeypatch.setenv("NCCL_IB_HCA", "=mlx5_1:1,mlx5_0,mlx5_1:2")
++
++    assert CollectiveGroup._detect_inter_node_nics(tmp_path) == [
++        "mlx5_0",
++        "mlx5_1",
++    ]
++
++
++def test_topology_nic_detection_falls_back_for_exclusion_syntax(
++    monkeypatch, tmp_path: Path
++) -> None:
++    monkeypatch.setenv("NCCL_IB_HCA", "^mlx5_3")
++    (tmp_path / "mlx5_0").mkdir()
++    (tmp_path / "mlx5_1").mkdir()
++
++    assert CollectiveGroup._detect_inter_node_nics(tmp_path) == [
++        "mlx5_0",
++        "mlx5_1",
++    ]
+diff --git a/vllm/distributed/unified_comm/README.md b/vllm/distributed/unified_comm/README.md
+index fbc9ffcdc..30cb03971 100644
+--- a/vllm/distributed/unified_comm/README.md
++++ b/vllm/distributed/unified_comm/README.md
+@@ -112,7 +112,6 @@ Optional knobs:
+ | `UNIFIED_COMM_NCCL_MULTI_NIC_DEVICES` | `auto-detect` | comma-separated NIC list (e.g. `mlx5_bond_1,mlx5_bond_2,...`), overrides auto-detection |
+ | `UNIFIED_COMM_NCCL_MULTI_NIC_COUNT` | `8` | max number of detected NICs to include when `UNIFIED_COMM_NCCL_MULTI_NIC_DEVICES` is unset |
+ | `UNIFIED_COMM_NCCL_MULTI_NIC_QPS_PER_CONNECTION` | `4` | forwarded to `NCCL_IB_QPS_PER_CONNECTION` |
+-| `UNIFIED_COMM_NCCL_MULTI_NIC_VERIFY_PEERS` | `1` | do peer-side NIC connectivity filtering using cross-rank GID checks before setting `NCCL_IB_HCA` |
+ | `UNIFIED_COMM_NCCL_MULTI_NIC_FORCE` | `0` | force override of an existing `NCCL_IB_HCA` |
+ 
+ When enabled successfully, the worker logs three confirmation lines
+diff --git a/vllm/distributed/unified_comm/backends/nccl_backend.py b/vllm/distributed/unified_comm/backends/nccl_backend.py
+index aceadc3ce..b2d2bbdab 100644
+--- a/vllm/distributed/unified_comm/backends/nccl_backend.py
++++ b/vllm/distributed/unified_comm/backends/nccl_backend.py
+@@ -19,7 +19,6 @@ Two execution modes are supported:
+ from __future__ import annotations
+ 
+ import contextlib
+-import fnmatch
+ import logging
+ import os
+ from dataclasses import dataclass
+@@ -43,7 +42,6 @@ _DEFAULT_MULTI_NIC_ENABLE = True
+ _DEFAULT_MULTI_NIC_COUNT = 8
+ _DEFAULT_MULTI_NIC_QPS_PER_CONNECTION = 4
+ _DEFAULT_MULTI_NIC_FORCE = False
+-_DEFAULT_MULTI_NIC_VERIFY_PEERS = True
+ 
+ 
+ def _env_enabled(name: str, default: bool = False) -> bool:
+@@ -155,7 +153,7 @@ class NCCLBackend(CommBackend):
+     def is_available(self) -> bool:
+         """检查当前环境是否有 CUDA + NCCL"""
+         try:
+-            return torch.cuda.is_available() and dist.is_nccl_available()
++            return torch.accelerator.is_available() and dist.is_nccl_available()
+         except Exception:
+             return False
+ 
+@@ -163,160 +161,20 @@ class NCCLBackend(CommBackend):
+     # 生命周期管理
+     # ----------------------------------------------------------
+ 
+-    def _discover_rdma_hcas(self, include_down: bool = False) -> list[str]:
+-        """自动发现 RDMA 网卡（兼容 mlx5 / mlx5_bond 命名）。"""
+-        ib_root = Path("/sys/class/infiniband")
+-        net_root = Path("/sys/class/net")
+-
+-        ib_names: set[str] = set()
+-        if ib_root.exists():
+-            for dev in ib_root.iterdir():
+-                if dev.is_dir():
+-                    ib_names.add(dev.name)
+-
+-        net_names: set[str] = set()
+-        if net_root.exists():
+-            for dev in net_root.iterdir():
+-                name = dev.name
+-                if fnmatch.fnmatch(name, "mlx5*"):
+-                    if not include_down:
+-                        operstate = dev / "operstate"
+-                        if operstate.exists():
+-                            with contextlib.suppress(Exception):
+-                                if operstate.read_text().strip() != "up":
+-                                    continue
+-                    net_names.add(name)
+-
+-        # 保持稳定顺序，优先 bond 设备
+-        all_names = sorted(ib_names | net_names)
+-        all_names.sort(key=lambda x: (0 if "bond" in x else 1, x))
+-        return all_names
+-
+-    def _read_hca_gids(self, hca: str) -> set[str]:
+-        """读取 HCA 的 GID，作为跨节点连通性的轻量指纹。"""
+-        gid_root = Path(f"/sys/class/infiniband/{hca}/ports")
+-        if not gid_root.exists():
+-            return set()
+-
+-        gid_index_env = os.environ.get("NCCL_IB_GID_INDEX", "").strip()
+-        gid_index: str | None = gid_index_env if gid_index_env else None
+-
+-        gids: set[str] = set()
+-        for gid_file in gid_root.glob("*/gids/*"):
+-            if gid_index is not None and gid_file.name != gid_index:
+-                continue
+-            with contextlib.suppress(Exception):
+-                gid = gid_file.read_text().strip().lower()
+-                if not gid:
+-                    continue
+-                # 全零 GID 没有路由意义
+-                if gid == "::":
+-                    continue
+-                if gid.replace(":", "") == "0" * 32:
+-                    continue
+-                gids.add(gid)
+-        return gids
+-
+-    def _filter_hcas_by_peer_connectivity(
+-        self,
+-        candidates: list[str],
+-        group_info: CommGroupInfo,
+-        config: CommConfig,
++    def _discover_rdma_hcas(
++        self, ib_root: Path = Path("/sys/class/infiniband")
+     ) -> list[str]:
+-        """
+-        基于跨 rank 的 GID 信息过滤本地 HCA，保留“更可能真实互通”的网卡。
+-
+-        说明：
+-        - 这是轻量联通性探测（通过 GID 子网交集），比“共同可见设备名”更接近真实网络。
+-        - 仍不替代 ib_write_bw 等压测工具。
+-        """
+-        verify_peers = config.extra.get(
+-            "multi_nic_verify_peers",
+-            _env_enabled(
+-                "UNIFIED_COMM_NCCL_MULTI_NIC_VERIFY_PEERS",
+-                default=_DEFAULT_MULTI_NIC_VERIFY_PEERS,
+-            ),
+-        )
+-        if not verify_peers or group_info.world_size <= 1:
+-            return candidates
+-
+-        if not dist.is_available() or not dist.is_initialized():
+-            logger.warning(
+-                "Skip peer NIC connectivity verification because torch.distributed is not initialized."
+-            )
+-            return candidates
+-
+-        local_hca_to_gids = {hca: sorted(self._read_hca_gids(hca)) for hca in candidates}
+-
+-        tmp_group: dist.ProcessGroup | None = None
+-        try:
+-            tmp_group = dist.new_group(ranks=group_info.ranks, backend="gloo")
+-            local_payload = {
+-                "rank": group_info.rank_in_group,
+-                "hca_to_gids": local_hca_to_gids,
+-            }
+-            gathered: list[dict[str, Any]] = [
+-                {} for _ in range(group_info.world_size)
+-            ]
+-            dist.all_gather_object(gathered, local_payload, group=tmp_group)
+-
+-            peer_gid_sets: list[set[str]] = []
+-            for item in gathered:
+-                if item.get("rank") == group_info.rank_in_group:
+-                    continue
+-                peer_map = item.get("hca_to_gids", {})
+-                one_peer_gids: set[str] = set()
+-                for gid_list in peer_map.values():
+-                    one_peer_gids.update(gid_list)
+-                peer_gid_sets.append(one_peer_gids)
+-
+-            filtered: list[str] = []
+-            dropped: list[str] = []
+-            for hca in candidates:
+-                local_gids = set(local_hca_to_gids.get(hca, []))
+-                if not local_gids:
+-                    dropped.append(hca)
+-                    continue
+-
+-                # 要求与每个 peer 至少有一个 GID 交集，减少“本机可见但对端不可达”。
+-                reachable_all_peers = all(
+-                    bool(local_gids & peer_gids) for peer_gids in peer_gid_sets
+-                )
+-                if reachable_all_peers:
+-                    filtered.append(hca)
+-                else:
+-                    dropped.append(hca)
+-
+-            if filtered:
+-                if dropped:
+-                    logger.info(
+-                        "Filtered non-connective HCAs by peer GID check: dropped=%s, kept=%s",
+-                        dropped,
+-                        filtered,
+-                    )
+-                return filtered
+-
+-            logger.warning(
+-                "Peer GID connectivity check filtered out all HCAs; fallback to local candidates=%s",
+-                candidates,
+-            )
+-            return candidates
+-        except Exception as e:
+-            logger.warning(
+-                "Peer NIC connectivity verification failed; fallback to local candidates %s, err=%s",
+-                candidates,
+-                e,
+-            )
+-            return candidates
+-        finally:
+-            if tmp_group is not None:
+-                with contextlib.suppress(Exception):
+-                    dist.destroy_process_group(tmp_group)
++        """Discover device names accepted by ``NCCL_IB_HCA``."""
++        if not ib_root.is_dir():
++            return []
++        with contextlib.suppress(OSError):
++            names = [entry.name for entry in ib_root.iterdir() if entry.is_dir()]
++            return sorted(names, key=lambda name: ("bond" not in name, name))
++        return []
+ 
+     def _maybe_enable_multi_nic_aggregation(
+         self,
+         config: CommConfig,
+-        group_info: CommGroupInfo,
+     ) -> None:
+         """
+         在 NCCLBackend 内部启用多网卡带宽聚合。
+@@ -330,7 +188,10 @@ class NCCLBackend(CommBackend):
+         # 允许通过 config.extra 覆盖环境变量，便于上层策略化控制
+         enabled = config.extra.get(
+             "multi_nic_enable",
+-            _env_enabled("UNIFIED_COMM_NCCL_MULTI_NIC_ENABLE", default=True),
++            _env_enabled(
++                "UNIFIED_COMM_NCCL_MULTI_NIC_ENABLE",
++                default=_DEFAULT_MULTI_NIC_ENABLE,
++            ),
+         )
+         if not enabled:
+             return
+@@ -365,7 +226,7 @@ class NCCLBackend(CommBackend):
+                 candidates = self._discover_rdma_hcas()
+             else:
+                 candidates = _split_csv(explicit_str)
+-        elif isinstance(explicit, (list, tuple)):
++        elif isinstance(explicit, list | tuple):
+             candidates = [str(x).strip() for x in explicit if str(x).strip()]
+         else:
+             candidates = self._discover_rdma_hcas()
+@@ -384,9 +245,16 @@ class NCCLBackend(CommBackend):
+                 str(_DEFAULT_MULTI_NIC_COUNT),
+             ),
+         )
+-        with contextlib.suppress(Exception):
++        try:
+             max_count = max(1, int(max_count_raw))
+-            candidates = candidates[:max_count]
++        except (TypeError, ValueError):
++            logger.warning(
++                "Invalid multi-NIC count %r; using default %d.",
++                max_count_raw,
++                _DEFAULT_MULTI_NIC_COUNT,
++            )
++            max_count = _DEFAULT_MULTI_NIC_COUNT
++        candidates = candidates[:max_count]
+ 
+         hca_csv = ",".join(candidates)
+         os.environ["NCCL_IB_HCA"] = hca_csv
+@@ -395,10 +263,21 @@ class NCCLBackend(CommBackend):
+ 
+         qps_raw = config.extra.get(
+             "multi_nic_qps_per_connection",
+-            os.environ.get("UNIFIED_COMM_NCCL_MULTI_NIC_QPS_PER_CONNECTION"),
++            os.environ.get(
++                "UNIFIED_COMM_NCCL_MULTI_NIC_QPS_PER_CONNECTION",
++                str(_DEFAULT_MULTI_NIC_QPS_PER_CONNECTION),
++            ),
+         )
+-        if qps_raw is not None:
+-            os.environ["NCCL_IB_QPS_PER_CONNECTION"] = str(qps_raw)
++        try:
++            qps = max(1, int(qps_raw))
++        except (TypeError, ValueError):
++            logger.warning(
++                "Invalid multi-NIC QPs per connection %r; using default %d.",
++                qps_raw,
++                _DEFAULT_MULTI_NIC_QPS_PER_CONNECTION,
++            )
++            qps = _DEFAULT_MULTI_NIC_QPS_PER_CONNECTION
++        os.environ["NCCL_IB_QPS_PER_CONNECTION"] = str(qps)
+ 
+         logger.info(
+             "NCCL multi-NIC aggregation enabled: NCCL_IB_HCA=%s, "
+@@ -419,7 +298,7 @@ class NCCLBackend(CommBackend):
+         B) 新建 ProcessGroup（默认行为）
+         """
+         # 在构建 PG 前尽早注入 NCCL 多网卡配置，确保生效。
+-        self._maybe_enable_multi_nic_aggregation(config, group_info)
++        self._maybe_enable_multi_nic_aggregation(config)
+ 
+         existing_device_group = config.extra.get("existing_device_group", None)
+         existing_cpu_group = config.extra.get("existing_cpu_group", None)
+@@ -529,14 +408,14 @@ class NCCLBackend(CommBackend):
+             unique_id.internal[i] = byte_val
+ 
+         # 初始化 NCCL Communicator
+-        with torch.cuda.device(device):
++        with torch.accelerator.device_index(device.index):
+             nccl_comm = nccl_lib.ncclCommInitRank(
+                 group_info.world_size, unique_id, group_info.rank_in_group
+             )
+ 
+         # Warmup
+-        with torch.cuda.device(device):
+-            stream = torch.cuda.current_stream(device)
++        with torch.accelerator.device_index(device.index):
++            stream = torch.accelerator.current_stream(device)
+             warmup_data = torch.zeros(1, device=device)
+             nccl_lib.ncclAllReduce(
+                 buffer_type(warmup_data.data_ptr()),
+@@ -560,7 +439,7 @@ class NCCLBackend(CommBackend):
+         """销毁通信组，释放所有资源"""
+         if comm_handle.nccl_comm is not None and comm_handle.nccl_lib is not None:
+             try:
+-                with torch.cuda.device(comm_handle.device):
++                with torch.accelerator.device_index(comm_handle.device.index):
+                     comm_handle.nccl_lib.ncclCommDestroy(comm_handle.nccl_comm)
+             except Exception as e:
+                 logger.warning("Failed to destroy NCCL comm: %s", e)
+@@ -611,7 +490,7 @@ class NCCLBackend(CommBackend):
+         out_tensor = torch.empty_like(input_tensor)
+ 
+         if stream is None:
+-            stream = torch.cuda.current_stream(comm_handle.device)
++            stream = torch.accelerator.current_stream(comm_handle.device)
+ 
+         comm_handle.nccl_lib.ncclAllReduce(
+             buffer_type(input_tensor.data_ptr()),
+@@ -675,7 +554,7 @@ class NCCLBackend(CommBackend):
+         )
+ 
+         if stream is None:
+-            stream = torch.cuda.current_stream(comm_handle.device)
++            stream = torch.accelerator.current_stream(comm_handle.device)
+ 
+         comm_handle.nccl_lib.ncclAllGather(
+             buffer_type(input_tensor.data_ptr()),
+@@ -748,7 +627,7 @@ class NCCLBackend(CommBackend):
+         )
+ 
+         if stream is None:
+-            stream = torch.cuda.current_stream(comm_handle.device)
++            stream = torch.accelerator.current_stream(comm_handle.device)
+ 
+         comm_handle.nccl_lib.ncclReduceScatter(
+             buffer_type(input_tensor.data_ptr()),
+@@ -799,7 +678,7 @@ class NCCLBackend(CommBackend):
+         assert tensor.device == comm_handle.device
+ 
+         if stream is None:
+-            stream = torch.cuda.current_stream(comm_handle.device)
++            stream = torch.accelerator.current_stream(comm_handle.device)
+ 
+         rank_in_group = comm_handle.group_info.rank_in_group
+         if rank_in_group == src:
+@@ -908,7 +787,7 @@ class NCCLBackend(CommBackend):
+             gather_dim += input_tensor.dim()
+ 
+         if stream is None:
+-            stream = torch.cuda.current_stream(comm_handle.device)
++            stream = torch.accelerator.current_stream(comm_handle.device)
+ 
+         # 切分 input
+         if scatter_sizes is not None:
+@@ -1002,7 +881,7 @@ class NCCLBackend(CommBackend):
+         assert tensor.device == comm_handle.device
+ 
+         if stream is None:
+-            stream = torch.cuda.current_stream(comm_handle.device)
++            stream = torch.accelerator.current_stream(comm_handle.device)
+ 
+         dtype = tensor.dtype
+         if "float8" in str(dtype):
+@@ -1053,7 +932,7 @@ class NCCLBackend(CommBackend):
+         assert tensor.device == comm_handle.device
+ 
+         if stream is None:
+-            stream = torch.cuda.current_stream(comm_handle.device)
++            stream = torch.accelerator.current_stream(comm_handle.device)
+ 
+         dtype = tensor.dtype
+         if "float8" in str(dtype):
+@@ -1083,7 +962,7 @@ class NCCLBackend(CommBackend):
+         if stream is not None:
+             stream.synchronize()
+         else:
+-            torch.cuda.synchronize()
++            torch.accelerator.synchronize()
+ 
+     # ----------------------------------------------------------
+     # 高级功能：NCCL Group API (仅 Mode B)
+@@ -1135,7 +1014,7 @@ class NCCLBackend(CommBackend):
+         )
+ 
+         if stream is None:
+-            stream = torch.cuda.current_stream(comm_handle.device)
++            stream = torch.accelerator.current_stream(comm_handle.device)
+ 
+         cuda_stream = cudaStream_t(stream.cuda_stream)
+ 
+diff --git a/vllm/distributed/unified_comm/collective.py b/vllm/distributed/unified_comm/collective.py
+index 173f1efe6..582f4f153 100644
+--- a/vllm/distributed/unified_comm/collective.py
++++ b/vllm/distributed/unified_comm/collective.py
+@@ -17,6 +17,8 @@ from __future__ import annotations
+ 
+ import contextlib
+ import logging
++import os
++from pathlib import Path
+ from typing import Any
+ 
+ import torch
+@@ -530,8 +532,6 @@ class CollectiveGroup:
+ 
+     def _detect_topology(self) -> TopologyInfo:
+         """自动探测硬件拓扑信息。"""
+-        import os
+-
+         device_type = self._group_info.device.type
+         gpus_per_node = 8  # 保守默认值
+ 
+@@ -572,11 +572,8 @@ class CollectiveGroup:
+         # 带宽估计
+         intra_bw = 600.0 if has_nvswitch else 300.0
+ 
+-        if has_rdma:
+-            # 估算聚合能力：单 NIC 100Gbps，按 NIC 数线性叠加并限制上限。
+-            inter_bw = min(800.0, 100.0 * nic_count)
+-        else:
+-            inter_bw = 25.0
++        # 估算聚合能力：单 NIC 100Gbps，按 NIC 数线性叠加并限制上限。
++        inter_bw = min(800.0, 100.0 * nic_count) if has_rdma else 25.0
+ 
+         return TopologyInfo(
+             num_nodes=num_nodes,
+@@ -605,20 +602,25 @@ class CollectiveGroup:
+         return result
+ 
+     @staticmethod
+-    def _detect_inter_node_nics() -> list[str]:
++    def _detect_inter_node_nics(
++        ib_root: Path = Path("/sys/class/infiniband"),
++    ) -> list[str]:
+         """探测可用于跨节点通信的 NIC 列表。"""
+-        import os
+-
+         nccl_hcas = os.environ.get("NCCL_IB_HCA", "").strip()
+         if nccl_hcas:
+-            return [x.strip() for x in nccl_hcas.split(",") if x.strip()]
+-
+-        ib_path = "/sys/class/infiniband"
+-        if os.path.exists(ib_path):
+-            with contextlib.suppress(Exception):
+-                devs = sorted(os.listdir(ib_path))
+-                if devs:
+-                    return devs
++            entries = [entry.strip() for entry in nccl_hcas.split(",")]
++            if not any(entry.startswith("^") for entry in entries):
++                names = {
++                    entry.removeprefix("=").split(":", 1)[0]
++                    for entry in entries
++                    if entry
++                }
++                if names:
++                    return sorted(names)
++
++        if ib_root.is_dir():
++            with contextlib.suppress(OSError):
++                return sorted(entry.name for entry in ib_root.iterdir())
+ 
+         # 最后兜底：默认单网卡
+         return []
+-- 
+2.53.0.windows.3
+

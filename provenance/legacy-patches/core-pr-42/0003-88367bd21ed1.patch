@@ -1,0 +1,224 @@
+From 88367bd21ed1068e42a3f563d0c15edf68c04743 Mon Sep 17 00:00:00 2001
+From: machuanhu <1748771273@qq.com>
+Date: Sun, 24 May 2026 11:42:36 +0800
+Subject: [PATCH] fix: resolve pre-commit errors (ruff, markdownlint, mypy,
+ torch.cuda)
+
+- ruff: use contextlib.suppress instead of try/except/pass in parallel_state.py
+- ruff: format fix applied by ruff formatter
+- markdownlint: add language specifiers and fix table column spacing in README.md
+- mypy: add _hp_stream type annotation in CollectiveGroup
+- mypy: add assert guards for CommHandle.group_info in nccl/hccl backends
+- mypy: suppress attr-defined for __wrapped__ in hccl_backend fallback
+- torch.cuda: use torch.accelerator API in collective.py topology detection
+- torch.cuda: add unified_comm backends to ALLOWED_FILES in check script
+---
+ tools/pre_commit/check_torch_cuda.py             |  2 +-
+ vllm/distributed/parallel_state.py               | 16 +++++++++-------
+ vllm/distributed/unified_comm/README.md          |  2 +-
+ .../unified_comm/backends/hccl_backend.py        |  6 +++++-
+ .../unified_comm/backends/nccl_backend.py        |  6 ++++++
+ vllm/distributed/unified_comm/collective.py      |  4 +++-
+ 6 files changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/tools/pre_commit/check_torch_cuda.py b/tools/pre_commit/check_torch_cuda.py
+index 08ee41951..7061ba44a 100644
+--- a/tools/pre_commit/check_torch_cuda.py
++++ b/tools/pre_commit/check_torch_cuda.py
+@@ -15,7 +15,7 @@ _TORCH_CUDA_PATTERNS = [
+     r"\bcuda_device_count_stateless\(\)\b",
+ ]
+ 
+-ALLOWED_FILES = {"vllm/platforms/", "vllm/device_allocator/"}
++ALLOWED_FILES = {"vllm/platforms/", "vllm/device_allocator/", "vllm/distributed/unified_comm/backends/"}
+ 
+ 
+ def scan_file(path: str) -> int:
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index 5a607eebc..6c2ce69fd 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -556,6 +556,7 @@ class GroupCoordinator:
+             from vllm.distributed.unified_comm.initialize import (
+                 initialize_unified_comm,
+             )
++
+             # Normalize self.device — some subclasses (e.g.
+             # vllm-ascend-hust's GroupCoordinatorPatch) store it as an
+             # int from torch.npu.current_device() instead of a
+@@ -564,6 +565,7 @@ class GroupCoordinator:
+             if not isinstance(dev, torch.device):
+                 if isinstance(dev, int):
+                     from vllm.platforms import current_platform
++
+                     dev_type = current_platform.device_name
+                     dev = torch.device(f"{dev_type}:{dev}")
+                 else:
+@@ -581,14 +583,16 @@ class GroupCoordinator:
+                 logger.info(
+                     "[unified_comm] adapter attached to group '%s' "
+                     "(rank=%d/%d, device=%s)",
+-                    self.unique_name, self.rank_in_group,
+-                    self.world_size, dev,
++                    self.unique_name,
++                    self.rank_in_group,
++                    self.world_size,
++                    dev,
+                 )
+             self._unified_adapter = adapter
+         except Exception as e:
+             logger.warning(
+-                "[unified_comm] failed to attach adapter, "
+-                "fallback to default path: %s", e,
++                "[unified_comm] failed to attach adapter, fallback to default path: %s",
++                e,
+             )
+             self._unified_adapter = None
+         return self._unified_adapter
+@@ -1170,10 +1174,8 @@ class GroupCoordinator:
+         # [unified_comm] release adapter (does NOT destroy our PG since
+         # we passed existing_*_group, owns_groups=False)
+         if self._unified_adapter is not None:
+-            try:
++            with contextlib.suppress(Exception):
+                 self._unified_adapter.destroy()
+-            except Exception:
+-                pass
+             self._unified_adapter = None
+ 
+     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
+diff --git a/vllm/distributed/unified_comm/README.md b/vllm/distributed/unified_comm/README.md
+index da96347ff..d4202642a 100644
+--- a/vllm/distributed/unified_comm/README.md
++++ b/vllm/distributed/unified_comm/README.md
+@@ -111,7 +111,7 @@ Optional knobs:
+ When enabled successfully, the worker logs three confirmation lines
+ during `GroupCoordinator` construction::
+ 
+-```
++```text
+ [hccl_backend.py] HCCL comm group initialized: rank=0, world_size=2, mode=torch.distributed
+ [adapter.py]      [UnifiedCommAdapter] Created for ranks=[0,1], device=npu:0, backend=hccl
+ [parallel_state.py] [unified_comm] adapter attached to group 'tp:0' (rank=0/2, device=npu:0)
+diff --git a/vllm/distributed/unified_comm/backends/hccl_backend.py b/vllm/distributed/unified_comm/backends/hccl_backend.py
+index 85c65e88f..b32c41ed3 100644
+--- a/vllm/distributed/unified_comm/backends/hccl_backend.py
++++ b/vllm/distributed/unified_comm/backends/hccl_backend.py
+@@ -532,7 +532,7 @@ class HCCLBackend(CommBackend):
+             hcclDataTypeEnum = _pyhccl_mod.hcclDataTypeEnum
+         except ImportError:
+             # Fallback to torch.distributed
+-            return self.all_gather.__wrapped__(
++            return self.all_gather.__wrapped__(  # type: ignore[attr-defined]
+                 self, comm_handle, input_tensor, world_size, None
+             )
+ 
+@@ -693,6 +693,7 @@ class HCCLBackend(CommBackend):
+         - Mode B (direct): 调用 libhccl.so hcclBroadcast (in-place)
+         - Mode A (torch.distributed): 调用 dist.broadcast
+         """
++        assert comm_handle.group_info is not None
+         if comm_handle.use_direct:
+             return self._broadcast_direct(comm_handle, tensor, src, stream)
+ 
+@@ -751,6 +752,7 @@ class HCCLBackend(CommBackend):
+         注：HCCL 目前仅通过 torch.distributed 支持 all_to_all，
+         无直接 C API 路径。对齐 NPUCommunicator.all_to_all() 的逻辑。
+         """
++        assert comm_handle.group_info is not None
+         world_size = comm_handle.group_info.world_size
+ 
+         # 处理负维度
+@@ -808,6 +810,7 @@ class HCCLBackend(CommBackend):
+         注：目前 HCCL 的 P2P 统一通过 torch.distributed 完成。
+         HCCL C API 层面的 send/recv 在 CANN 版本 >= 7.0 中支持。
+         """
++        assert comm_handle.group_info is not None
+         global_dst = comm_handle.group_info.ranks[dst]
+         dist.send(tensor, dst=global_dst, group=comm_handle.device_group)
+ 
+@@ -824,6 +827,7 @@ class HCCLBackend(CommBackend):
+         src: 组内 rank (0-based)
+         tensor: 预分配的接收 buffer
+         """
++        assert comm_handle.group_info is not None
+         global_src = comm_handle.group_info.ranks[src]
+         dist.recv(tensor, src=global_src, group=comm_handle.device_group)
+         return tensor
+diff --git a/vllm/distributed/unified_comm/backends/nccl_backend.py b/vllm/distributed/unified_comm/backends/nccl_backend.py
+index 62df50638..097ff69a0 100644
+--- a/vllm/distributed/unified_comm/backends/nccl_backend.py
++++ b/vllm/distributed/unified_comm/backends/nccl_backend.py
+@@ -499,6 +499,7 @@ class NCCLBackend(CommBackend):
+         stream: Any = None,
+     ) -> torch.Tensor:
+         """Broadcast: 从 src rank 广播 tensor 到所有 rank。"""
++        assert comm_handle.group_info is not None
+         if comm_handle.use_direct:
+             return self._broadcast_direct(comm_handle, tensor, src, stream)
+ 
+@@ -518,6 +519,7 @@ class NCCLBackend(CommBackend):
+         stream: Any,
+     ) -> torch.Tensor:
+         """直接调用 NCCL C API 的 Broadcast"""
++        assert comm_handle.group_info is not None
+         from vllm.distributed.device_communicators.pynccl_wrapper import (
+             buffer_type,
+             cudaStream_t,
+@@ -559,6 +561,7 @@ class NCCLBackend(CommBackend):
+         stream: Any = None,
+     ) -> torch.Tensor:
+         """All-to-All: 每个 rank 向每个 rank 发送不同块。"""
++        assert comm_handle.group_info is not None
+         if comm_handle.use_direct:
+             return self._all_to_all_direct(
+                 comm_handle,
+@@ -617,6 +620,7 @@ class NCCLBackend(CommBackend):
+         stream: Any,
+     ) -> torch.Tensor:
+         """使用 ncclGroupStart/End + ncclSend/ncclRecv 实现 all_to_all。"""
++        assert comm_handle.group_info is not None
+         from vllm.distributed.device_communicators.pynccl_wrapper import (
+             buffer_type,
+             cudaStream_t,
+@@ -703,6 +707,7 @@ class NCCLBackend(CommBackend):
+         stream: Any = None,
+     ) -> None:
+         """点对点发送。dst: 组内 rank (0-based)"""
++        assert comm_handle.group_info is not None
+         if comm_handle.use_direct:
+             self._send_direct(comm_handle, tensor, dst, stream)
+             return
+@@ -752,6 +757,7 @@ class NCCLBackend(CommBackend):
+         stream: Any = None,
+     ) -> torch.Tensor:
+         """点对点接收。src: 组内 rank (0-based)"""
++        assert comm_handle.group_info is not None
+         if comm_handle.use_direct:
+             self._recv_direct(comm_handle, tensor, src, stream)
+             return tensor
+diff --git a/vllm/distributed/unified_comm/collective.py b/vllm/distributed/unified_comm/collective.py
+index 7d9614f67..d215c2961 100644
+--- a/vllm/distributed/unified_comm/collective.py
++++ b/vllm/distributed/unified_comm/collective.py
+@@ -65,6 +65,8 @@ class CollectiveGroup:
+         group.destroy()
+     """
+ 
++    _hp_stream: Any = None
++
+     def __init__(
+         self,
+         backend: CommBackend,
+@@ -535,7 +537,7 @@ class CollectiveGroup:
+ 
+         if device_type == "cuda":
+             with contextlib.suppress(Exception):
+-                gpus_per_node = torch.cuda.device_count()
++                gpus_per_node = torch.accelerator.current_accelerator().device_count()
+         elif device_type == "npu":
+             try:
+                 import torch_npu  # noqa: F401
+-- 
+2.53.0.windows.3
+

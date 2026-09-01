@@ -1,0 +1,4580 @@
+From 8a517694b1a453b2c9f212ebbd189e3d7236eb04 Mon Sep 17 00:00:00 2001
+From: machuanhu <1748771273@qq.com>
+Date: Fri, 22 May 2026 18:31:03 +0800
+Subject: [PATCH] feat(distributed): add unified_comm communication abstraction
+ layer
+
+- introduce vllm/distributed/unified_comm/ subpackage providing a
+  device-agnostic, layered communication abstraction:
+  Layer 1 CommBackend (NCCL/HCCL adapters), Layer 2 CollectiveOps,
+  Layer 3 TransferPlane, Layer 4 CommStrategy
+- new entry points: UnifiedCommAdapter and is_unified_comm_enabled
+- HCCL backend supports two execution modes selectable via env:
+  Mode A (default, torch.distributed) and Mode B (direct libhccl.so
+  via pyhccl_wrapper, gated by UNIFIED_COMM_USE_DIRECT_HCCL=1)
+- NCCL backend symmetrically supports Mode A / Mode B
+- the layer is strictly opt-in: nothing in this commit changes the
+  default code path; activation requires UNIFIED_COMM_ENABLED=1 in
+  the environment
+- README.md documents the architecture, integration model, env
+  variables, and extension points
+
+This commit only adds the new package. The integration into
+GroupCoordinator and the smoke tests live in follow-up commits to
+keep the diff reviewable.
+
+Signed-off-by: machuanhu <1748771273@qq.com>
+---
+ vllm/distributed/unified_comm/README.md       | 200 ++++
+ vllm/distributed/unified_comm/__init__.py     |  82 ++
+ vllm/distributed/unified_comm/adapter.py      | 285 ++++++
+ vllm/distributed/unified_comm/backend.py      | 343 +++++++
+ .../unified_comm/backends/__init__.py         |   7 +
+ .../unified_comm/backends/hccl_backend.py     | 875 +++++++++++++++++
+ .../unified_comm/backends/nccl_backend.py     | 900 ++++++++++++++++++
+ vllm/distributed/unified_comm/collective.py   | 739 ++++++++++++++
+ vllm/distributed/unified_comm/initialize.py   | 148 +++
+ vllm/distributed/unified_comm/strategy.py     | 377 ++++++++
+ .../unified_comm/transfer_plane.py            | 464 +++++++++
+ vllm/distributed/unified_comm/types.py        |  32 +
+ 12 files changed, 4452 insertions(+)
+ create mode 100644 vllm/distributed/unified_comm/README.md
+ create mode 100644 vllm/distributed/unified_comm/__init__.py
+ create mode 100644 vllm/distributed/unified_comm/adapter.py
+ create mode 100644 vllm/distributed/unified_comm/backend.py
+ create mode 100644 vllm/distributed/unified_comm/backends/__init__.py
+ create mode 100644 vllm/distributed/unified_comm/backends/hccl_backend.py
+ create mode 100644 vllm/distributed/unified_comm/backends/nccl_backend.py
+ create mode 100644 vllm/distributed/unified_comm/collective.py
+ create mode 100644 vllm/distributed/unified_comm/initialize.py
+ create mode 100644 vllm/distributed/unified_comm/strategy.py
+ create mode 100644 vllm/distributed/unified_comm/transfer_plane.py
+ create mode 100644 vllm/distributed/unified_comm/types.py
+
+diff --git a/vllm/distributed/unified_comm/README.md b/vllm/distributed/unified_comm/README.md
+new file mode 100644
+index 000000000..da96347ff
+--- /dev/null
++++ b/vllm/distributed/unified_comm/README.md
+@@ -0,0 +1,200 @@
++# Unified Communication Abstraction Layer (`unified_comm`)
++
++A pluggable, device-agnostic communication layer for vllm-hust.
++
++It sits between vLLM's `GroupCoordinator` and the underlying backends
++(NCCL / HCCL / future MetaX CCL) and is **strictly opt-in**: when the
++environment variable `UNIFIED_COMM_ENABLED` is unset or `0`, this code
++is **never imported** at runtime and the default vLLM code path is
++unaffected.
++
++The design has been validated end-to-end on Ascend 910B2 with TP=2
++inference (Qwen2.5-7B-Instruct, random-online, 200 prompts, 0 failures).
++
++---
++
++## Architecture
++
++```
++                +-----------------------------------+
++                |  GroupCoordinator (vllm/upstream) |
++                |  _all_reduce_out_place(...)       |
++                |  _all_gather_out_place(...)       |
++                |  _reduce_scatter_out_place(...)   |
++                |  broadcast(...)                   |
++                +-----------------+-----------------+
++                                  | hook: _get_unified_adapter()
++                                  v
++                       +----------+----------+         (lazy build,
++                       |  UnifiedCommAdapter |          one per group)
++                       +----------+----------+
++                                  |
++   Layer 4 ------------ +---------+---------+ ----- selects
++   Strategy             |  CommStrategy     |        algorithm + link
++                        +---------+---------+
++                                  |
++   Layer 3 ------------ +---------+---------+ ----- KV / EC / Weight
++   TransferPlane        |  TransferPlane    |        transfers reuse
++                        +---------+---------+        the same group
++                                  |
++   Layer 2 ------------ +---------+---------+ ----- AllReduce / AllGather
++   CollectiveOps        |  CollectiveGroup  |        / Broadcast / RS
++                        +---------+---------+
++                                  |
++   Layer 1 ------------ +---------+---------+ ----- NCCL / HCCL / ...
++   CommBackend          |  CommBackend      |        (registry pattern)
++                        +-------------------+
++```
++
++| Layer | Responsibility | Key types |
++|---|---|---|
++| 1 - `CommBackend` | hide library-level differences | `CommBackend`, `NCCLBackend`, `HCCLBackend`, `CommBackendRegistry` |
++| 2 - `CollectiveOps` | device-agnostic collectives, lifecycle | `CollectiveGroup`, `CollectiveOps`, `ReduceOp` |
++| 3 - `TransferPlane` | unified transfers (KV / EC / weight) | `TransferPlane`, `TransferPlaneRegistry`, `TransferType` |
++| 4 - `CommStrategy` | choose algorithm by topology / size | `CommStrategy`, `DefaultStrategy`, `ConfigDrivenStrategy` |
++| Bridge | adapt the above into vLLM | `UnifiedCommAdapter`, `is_unified_comm_enabled` |
++
++---
++
++## How it integrates into vLLM
++
++The only change in `vllm/distributed/parallel_state.py` is a tiny hook
++inside `GroupCoordinator`:
++
++```python
++class GroupCoordinator:
++    # class-level defaults survive subclasses that override __init__()
++    # without calling super().__init__()
++    _unified_adapter: Any | None = None
++    _unified_adapter_built: bool = False
++
++    def _get_unified_adapter(self):
++        # built lazily on first access; idempotent on failure.
++        ...
++
++    def _all_reduce_out_place(self, x):
++        adapter = self._get_unified_adapter()
++        if adapter is not None:
++            out = adapter.all_reduce(x)
++            if out is not None:
++                return out
++        # default code path below is untouched
++        return self.device_communicator.all_reduce(x)
++```
++
++Every collective routes through the same pattern, so a single boolean
++flag enables/disables the whole layer.
++
++The hook is intentionally **lazy** rather than constructor-based so
++that subclasses such as `vllm-ascend-hust`'s `GroupCoordinatorPatch`
++- which overrides `__init__` without calling `super().__init__()` -
++still pick up the adapter and the safe fallback defaults.
++
++---
++
++## How to enable
++
++Single environment variable:
++
++```bash
++export UNIFIED_COMM_ENABLED=1
++```
++
++Optional knobs:
++
++| Variable | Default | Effect |
++|---|---|---|
++| `UNIFIED_COMM_ENABLED` | `0` | master switch; everything else has no effect when this is off |
++| `UNIFIED_COMM_USE_DIRECT_HCCL` | `0` | (HCCL only) bypass `torch.distributed` and call `libhccl.so` directly via `pyhccl_wrapper` |
++| `UNIFIED_COMM_USE_DIRECT_NCCL` | `0` | (NCCL only) bypass `torch.distributed` and call `libnccl.so` directly |
++
++When enabled successfully, the worker logs three confirmation lines
++during `GroupCoordinator` construction::
++
++```
++[hccl_backend.py] HCCL comm group initialized: rank=0, world_size=2, mode=torch.distributed
++[adapter.py]      [UnifiedCommAdapter] Created for ranks=[0,1], device=npu:0, backend=hccl
++[parallel_state.py] [unified_comm] adapter attached to group 'tp:0' (rank=0/2, device=npu:0)
++```
++
++If any step fails the adapter returns `None` and a single warning is
++emitted; the default code path resumes silently.
++
++---
++
++## End-to-end validation
++
++| metric | value |
++|---|---|
++| HW | Ascend 910B2 x 2 |
++| Model | Qwen2.5-7B-Instruct, FP16, TP=2 |
++| Workload | random-online, input=1024, output=256, num_prompts=200, rate=1.0 |
++| Output throughput | **233.0 tok/s** |
++| Mean / P99 TTFT | 214.0 / 291.8 ms |
++| Mean / P99 TPOT | 77.0 / 79.7 ms |
++| Failures | 0 / 200 |
++
++Smoke benchmarks of the adapter itself (compared against `dist.all_reduce`
++on the same group) show `<10 us` overhead on small messages and
++parity at >=1 MB messages. After the small-tensor fast-path the
++`unified_comm` adapter recovers ~80% of the early-version
++small-message gap; the Mode B (direct HCCL C API) variant additionally
++gives **+1.4% throughput / -1.6% TPOT** on the end-to-end path under
++graph mode.
++
++---
++
++## Tests
++
++```bash
++# 2-card smoke test (skips automatically when fewer than 2 accelerators)
++pytest tests/distributed/test_unified_comm.py -v
++```
++
++The tests cover:
++- feature-flag plumbing (default off, multiple truthy/falsy spellings)
++- adapter construction returning `None` when disabled
++- numerical parity for `all_reduce`, `all_gather`, `broadcast` against
++  values produced by the underlying `torch.distributed` PG.
++
++---
++
++## Extending
++
++### Adding a new device backend
++
++1. Subclass `CommBackend` from
++   `vllm/distributed/unified_comm/backend.py`.
++2. Register it in `CommBackendRegistry` by calling
++   `register_backend("my_device", MyBackend)` from your plugin's
++   initialization code (or by adding it to
++   `unified_comm/backends/__init__.py` and the dispatch table in
++   `initialize.py`).
++3. The bridging code in `parallel_state.py` is device-agnostic; it
++   normalizes `self.device` to `torch.device` before calling
++   `try_create`.
++
++### Adding a new transfer plane
++
++1. Subclass `TransferPlane` from
++   `vllm/distributed/unified_comm/transfer_plane.py`.
++2. Register an instance with
++   `TransferPlaneRegistry().register(TransferType.MY_TYPE, plane)`.
++3. The plane will be wired up to the `CollectiveGroup` automatically
++   the first time a `UnifiedCommAdapter` is created.
++
++---
++
++## Caveats / follow-ups
++
++- A subset of inline comments and method-level docstrings inside
++  `collective.py`, `strategy.py`, `transfer_plane.py`, `backend.py`,
++  `initialize.py`, and the two backend files are still mixed Chinese.
++  These will be translated in a follow-up PR.
++- The NCCL backend has been kept in tree to keep the layer
++  symmetric and to satisfy the registry, but it has not been exercised
++  on a GPU machine yet; it is gated behind the same opt-in flag.
++- The adapter currently delegates only the four primitives that
++  `GroupCoordinator._*_out_place` and `broadcast` use. `send` /
++  `recv` / `all_to_all` are exposed at the adapter layer for future
++  use but are not wired into `parallel_state.py` yet.
+diff --git a/vllm/distributed/unified_comm/__init__.py b/vllm/distributed/unified_comm/__init__.py
+new file mode 100644
+index 000000000..d8fe8edf8
+--- /dev/null
++++ b/vllm/distributed/unified_comm/__init__.py
+@@ -0,0 +1,82 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Unified Communication Abstraction Layer for vllm-hust.
++
++Four-layer architecture:
++  Layer 1: CommBackend     - device-level backend abstraction
++                             (hides NCCL / HCCL / MetaX CCL differences)
++  Layer 2: CollectiveOps   - device-agnostic collective primitives
++                             (AllReduce / AllGather / Broadcast / ...)
++  Layer 3: TransferPlane   - unified transfer abstraction for
++                             KV-cache / EC / weight movement
++  Layer 4: CommStrategy    - selects algorithm and link based on
++                             topology, message size, and pattern
++
++Integration:
++  UnifiedCommAdapter       - bridges this layer into vLLM's
++                             ``GroupCoordinator``. Activated only when
++                             the environment variable
++                             ``UNIFIED_COMM_ENABLED=1`` is set; the
++                             default code path is unaffected otherwise.
++"""
++
++from vllm.distributed.unified_comm.adapter import (
++    UnifiedCommAdapter,
++    is_unified_comm_enabled,
++)
++from vllm.distributed.unified_comm.backend import (
++    CommBackend,
++    CommBackendRegistry,
++    CommConfig,
++    CommGroupInfo,
++    ReduceOp,
++    get_available_backend,
++    get_backend,
++    register_backend,
++)
++from vllm.distributed.unified_comm.collective import (
++    CollectiveGroup,
++    CollectiveOps,
++)
++from vllm.distributed.unified_comm.strategy import (
++    CommStrategy,
++    ConfigDrivenStrategy,
++    DefaultStrategy,
++    TopologyInfo,
++)
++from vllm.distributed.unified_comm.transfer_plane import (
++    TransferPlane,
++    TransferPlaneRegistry,
++)
++from vllm.distributed.unified_comm.types import (
++    TransferProtocol,
++    TransferType,
++)
++
++__all__ = [
++    # Integration Adapter
++    "UnifiedCommAdapter",
++    "is_unified_comm_enabled",
++    # Layer 1: Device Backend
++    "CommBackend",
++    "CommBackendRegistry",
++    "CommConfig",
++    "CommGroupInfo",
++    "ReduceOp",
++    "register_backend",
++    "get_backend",
++    "get_available_backend",
++    # Layer 2: Collective Ops
++    "CollectiveOps",
++    "CollectiveGroup",
++    # Layer 3: Transfer Plane
++    "TransferPlane",
++    "TransferPlaneRegistry",
++    "TransferProtocol",
++    "TransferType",
++    # Layer 4: Strategy
++    "CommStrategy",
++    "DefaultStrategy",
++    "ConfigDrivenStrategy",
++    "TopologyInfo",
++]
+diff --git a/vllm/distributed/unified_comm/adapter.py b/vllm/distributed/unified_comm/adapter.py
+new file mode 100644
+index 000000000..ee77a5e41
+--- /dev/null
++++ b/vllm/distributed/unified_comm/adapter.py
+@@ -0,0 +1,285 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Adapter that bridges ``unified_comm`` into vLLM's ``GroupCoordinator``.
++
++Implements the adapter pattern: a :class:`GroupCoordinator` may
++optionally delegate its collective operations to a ``CollectiveGroup``
++from this package while keeping its public interface unchanged.
++
++The adapter is activated only when the environment variable
++``UNIFIED_COMM_ENABLED=1`` is set; otherwise it is never built and the
++default code path is used.
++
++Design principles:
++  - Non-intrusive: the ``GroupCoordinator`` base class and any vLLM
++    upstream files are not modified beyond the small hook used to
++    obtain the adapter lazily.
++  - Safe fallback: any exception during construction or execution
++    falls back to the default code path.
++  - Lazy initialization: the unified_comm modules are only imported
++    when the adapter is actually requested.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++from typing import Any
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++
++def is_unified_comm_enabled() -> bool:
++    """Return True if the unified communication layer is enabled."""
++    val = os.environ.get("UNIFIED_COMM_ENABLED", "0").lower()
++    return val in ("1", "true", "yes")
++
++
++class UnifiedCommAdapter:
++    """Adapter that bridges a unified_comm ``CollectiveGroup`` to vLLM's
++    ``GroupCoordinator``-compatible interface.
++
++    Responsibilities:
++      - Hold a ``CollectiveGroup`` instance on behalf of a
++        ``GroupCoordinator``.
++      - Translate vLLM's collective calls (``all_reduce``,
++        ``all_gather``, ``reduce_scatter``, ...) into
++        ``CollectiveGroup`` calls.
++      - Reconcile interface differences (``dim`` argument handling,
++        ``ReduceOp`` conversions, etc.).
++      - Return ``None`` from any operation on failure so the caller
++        can fall back to the default code path.
++
++    Usage::
++
++        adapter = UnifiedCommAdapter.try_create(ranks, rank, device)
++        if adapter is not None:
++            result = adapter.all_reduce(tensor)
++            if result is not None:
++                return result  # success
++        # otherwise fall back to the default code path
++    """
++
++    def __init__(self, collective_group: Any):
++        self._group = collective_group
++        # Bind the group to any registered TransferPlane(s).
++        self._initialize_transfer_planes()
++
++    @classmethod
++    def try_create(
++        cls,
++        ranks: list[int],
++        local_rank: int,
++        device: torch.device,
++        existing_device_group: Any = None,
++        existing_cpu_group: Any = None,
++    ) -> UnifiedCommAdapter | None:
++        """Try to construct an adapter.
++
++        Returns ``None`` when unified_comm is not enabled or when
++        construction fails for any reason; the caller is expected to
++        fall back to the default code path.
++
++        Args:
++            ranks: global ranks belonging to this group.
++            local_rank: this process' global rank.
++            device: device to bind the communication to.
++            existing_device_group: pre-existing device ``ProcessGroup``
++                (when reusing the one created by ``GroupCoordinator``).
++            existing_cpu_group: pre-existing CPU ``ProcessGroup``.
++        """
++        if not is_unified_comm_enabled():
++            return None
++
++        try:
++            from vllm.distributed.unified_comm.collective import (
++                CollectiveGroup,
++            )
++
++            group = CollectiveGroup.create(
++                ranks=ranks,
++                local_rank=local_rank,
++                device=device,
++                existing_device_group=existing_device_group,
++                existing_cpu_group=existing_cpu_group,
++            )
++            logger.info(
++                "[UnifiedCommAdapter] Created for ranks=%s, "
++                "local_rank=%s, device=%s, backend=%s",
++                ranks,
++                local_rank,
++                device,
++                group.backend_name,
++            )
++            return cls(group)
++        except Exception as e:
++            logger.warning(
++                "[UnifiedCommAdapter] Failed to create CollectiveGroup, "
++                "falling back to original path: %s",
++                e,
++            )
++            return None
++
++    # ----------------------------------------------------------
++    # Collective-op adapters
++    # ----------------------------------------------------------
++
++    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor | None:
++        """Adapter for AllReduce; returns ``None`` on failure."""
++        try:
++            from vllm.distributed.unified_comm.backend import ReduceOp
++
++            return self._group.all_reduce(input_, op=ReduceOp.SUM)
++        except Exception as e:
++            logger.warning("[UnifiedCommAdapter] all_reduce failed: %s", e)
++            return None
++
++    def all_gather(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor | None:
++        """Adapter for AllGather; returns ``None`` on failure.
++
++        Handles the ``dim`` argument by transposing to dim-0 around the
++        underlying call when ``dim != 0``.
++        """
++        try:
++            if dim == 0:
++                return self._group.all_gather(input_)
++            else:
++                perm = list(range(input_.dim()))
++                perm[0], perm[dim] = perm[dim], perm[0]
++                transposed = input_.permute(perm).contiguous()
++                gathered = self._group.all_gather(transposed)
++                return gathered.permute(perm).contiguous()
++        except Exception as e:
++            logger.warning("[UnifiedCommAdapter] all_gather failed: %s", e)
++            return None
++
++    def reduce_scatter(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor | None:
++        """Adapter for ReduceScatter; returns ``None`` on failure."""
++        try:
++            from vllm.distributed.unified_comm.backend import ReduceOp
++
++            if dim == 0:
++                return self._group.reduce_scatter(input_, op=ReduceOp.SUM)
++            else:
++                perm = list(range(input_.dim()))
++                perm[0], perm[dim] = perm[dim], perm[0]
++                transposed = input_.permute(perm).contiguous()
++                scattered = self._group.reduce_scatter(transposed, op=ReduceOp.SUM)
++                return scattered.permute(perm).contiguous()
++        except Exception as e:
++            logger.warning(
++                "[UnifiedCommAdapter] reduce_scatter failed: %s",
++                e,
++            )
++            return None
++
++    def broadcast(self, input_: torch.Tensor, src: int = 0) -> torch.Tensor | None:
++        """Adapter for Broadcast; returns ``None`` on failure."""
++        try:
++            return self._group.broadcast(input_, src=src)
++        except Exception as e:
++            logger.warning("[UnifiedCommAdapter] broadcast failed: %s", e)
++            return None
++
++    def send(self, input_: torch.Tensor, dst: int) -> bool | None:
++        """Adapter for point-to-point send.
++
++        Returns ``True`` on success, ``None`` on failure (caller should
++        fall back).
++        """
++        try:
++            self._group.send(input_, dst)
++            return True
++        except Exception as e:
++            logger.warning("[UnifiedCommAdapter] send failed: %s", e)
++            return None
++
++    def recv(self, input_: torch.Tensor, src: int) -> torch.Tensor | None:
++        """Adapter for point-to-point recv; returns ``None`` on failure."""
++        try:
++            return self._group.recv(input_, src)
++        except Exception as e:
++            logger.warning("[UnifiedCommAdapter] recv failed: %s", e)
++            return None
++
++    def all_to_all(
++        self,
++        input_: torch.Tensor,
++        scatter_dim: int = 0,
++        gather_dim: int = -1,
++        scatter_sizes: list[int] | None = None,
++        gather_sizes: list[int] | None = None,
++    ) -> torch.Tensor | None:
++        """Adapter for All-to-All; returns ``None`` on failure."""
++        try:
++            return self._group.all_to_all(
++                input_, scatter_dim, gather_dim, scatter_sizes, gather_sizes
++            )
++        except Exception as e:
++            logger.warning("[UnifiedCommAdapter] all_to_all failed: %s", e)
++            return None
++
++    def barrier(self) -> bool | None:
++        """Adapter for a synchronization barrier.
++
++        Returns ``True`` on success, ``None`` on failure.
++        """
++        try:
++            self._group.barrier()
++            return True
++        except Exception as e:
++            logger.warning("[UnifiedCommAdapter] barrier failed: %s", e)
++            return None
++
++    # ----------------------------------------------------------
++    # Lifecycle
++    # ----------------------------------------------------------
++
++    def _initialize_transfer_planes(self) -> None:
++        """Bind the underlying ``CollectiveGroup`` to any registered
++        ``TransferPlane`` instances."""
++        try:
++            from vllm.distributed.unified_comm.transfer_plane import (
++                TransferPlaneRegistry,
++            )
++
++            registry = TransferPlaneRegistry()
++            for transfer_type in registry.list_planes():
++                plane = registry.get(transfer_type)
++                if not getattr(plane, "_initialized", False):
++                    plane.initialize(self._group)
++                    logger.debug(
++                        "[UnifiedCommAdapter] Initialized TransferPlane: %s",
++                        transfer_type.name,
++                    )
++        except Exception as e:
++            logger.debug(
++                "[UnifiedCommAdapter] TransferPlane initialization skipped: %s",
++                e,
++            )
++
++    def destroy(self) -> None:
++        """Release the underlying ``CollectiveGroup``."""
++        try:
++            if self._group is not None:
++                self._group.destroy()
++                self._group = None
++        except Exception as e:
++            logger.warning("[UnifiedCommAdapter] destroy failed: %s", e)
++
++    @property
++    def strategy_name(self) -> str:
++        """Name of the currently active strategy, or ``"none"``."""
++        try:
++            if self._group and self._group._strategy:
++                return self._group._strategy.name()
++        except Exception:
++            pass
++        return "none"
++
++    def __repr__(self) -> str:
++        if self._group:
++            return f"UnifiedCommAdapter(group={self._group})"
++        return "UnifiedCommAdapter(destroyed)"
+diff --git a/vllm/distributed/unified_comm/backend.py b/vllm/distributed/unified_comm/backend.py
+new file mode 100644
+index 000000000..336752891
+--- /dev/null
++++ b/vllm/distributed/unified_comm/backend.py
+@@ -0,0 +1,343 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Layer 1: ``CommBackend`` - device-level communication backend.
++
++Hides the differences between underlying communication libraries
++(NCCL / HCCL / MetaX CCL) and exposes a uniform set of low-level
++collective primitives.
++
++Design principles:
++  - Interfaces are declared as ABCs.
++  - Backends are pluggable via a registry.
++  - A backend implementation only needs to know *how* to communicate;
++    *when* to communicate is decided by the layers above.
++"""
++
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from dataclasses import dataclass, field
++from enum import Enum, auto
++from typing import Any
++
++import torch
++import torch.distributed as dist
++
++# ============================================================
++# 基础数据类型定义
++# ============================================================
++
++
++class ReduceOp(Enum):
++    """归约操作类型，设备无关"""
++
++    SUM = auto()
++    PRODUCT = auto()
++    MAX = auto()
++    MIN = auto()
++    AVG = auto()
++
++    def to_torch(self) -> dist.ReduceOp:
++        """转为 torch 原生 ReduceOp"""
++        # OPT #3: 模块级 mapping, 避免每次调用重建 dict
++        try:
++            return _REDUCE_OP_TO_TORCH[self]
++        except KeyError:
++            if self == ReduceOp.AVG:
++                raise ValueError(
++                    "AVG not directly supported by torch ReduceOp, use SUM + divide"
++                ) from None
++            raise
++
++
++# OPT #3: 模块级 mapping 表 (放在 ReduceOp 之后, 因为依赖类成员)
++_REDUCE_OP_TO_TORCH: dict[ReduceOp, dist.ReduceOp] = {
++    ReduceOp.SUM: dist.ReduceOp.SUM,
++    ReduceOp.PRODUCT: dist.ReduceOp.PRODUCT,
++    ReduceOp.MAX: dist.ReduceOp.MAX,
++    ReduceOp.MIN: dist.ReduceOp.MIN,
++}
++
++
++@dataclass
++class CommConfig:
++    """通信后端配置"""
++
++    library_path: str | None = None  # 通信库路径（如 libhccl.so）
++    enable_high_priority_stream: bool = False  # 是否使用高优先级流
++    timeout_seconds: float = 300.0  # 超时时间
++    extra: dict[str, Any] = field(default_factory=dict)  # 后端特有配置
++
++
++@dataclass
++class CommGroupInfo:
++    """通信组描述"""
++
++    ranks: list[int]  # 组内全局 rank 列表
++    rank_in_group: int  # 当前进程在组内的 rank
++    world_size: int  # 组大小
++    device: torch.device  # 绑定设备
++    backend_name: str = ""  # 使用的后端名称
++
++
++# ============================================================
++# CommBackend 抽象基类
++# ============================================================
++
++
++class CommBackend(ABC):
++    """
++    设备通信后端抽象基类。
++
++    每种硬件（NVIDIA GPU / Ascend NPU / MetaX GPU）实现一个具体子类。
++    只需实现底层通信原语，上层的组合逻辑由 CollectiveOps 处理。
++    """
++
++    @property
++    @abstractmethod
++    def name(self) -> str:
++        """后端名称标识，如 'nccl', 'hccl', 'metax_ccl'"""
++        ...
++
++    @property
++    @abstractmethod
++    def device_type(self) -> str:
++        """支持的设备类型，如 'cuda', 'npu', 'metax'"""
++        ...
++
++    @abstractmethod
++    def is_available(self) -> bool:
++        """检查当前环境是否支持此后端"""
++        ...
++
++    # ----------------------------------------------------------
++    # 生命周期
++    # ----------------------------------------------------------
++
++    @abstractmethod
++    def init_comm_group(self, group_info: CommGroupInfo, config: CommConfig) -> Any:
++        """
++        初始化通信组，返回后端内部的通信句柄（communicator handle）。
++
++        Args:
++            group_info: 通信组描述信息
++            config: 后端配置
++
++        Returns:
++            comm_handle: 后端内部通信句柄，后续操作需传入
++        """
++        ...
++
++    @abstractmethod
++    def destroy_comm_group(self, comm_handle: Any) -> None:
++        """销毁通信组，释放资源"""
++        ...
++
++    # ----------------------------------------------------------
++    # 集合通信原语
++    # ----------------------------------------------------------
++
++    @abstractmethod
++    def all_reduce(
++        self,
++        comm_handle: Any,
++        input_tensor: torch.Tensor,
++        op: ReduceOp = ReduceOp.SUM,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        AllReduce：所有进程对 tensor 执行归约，结果写回所有进程。
++
++        Returns:
++            归约后的 tensor（可以是 in-place 或新 tensor）
++        """
++        ...
++
++    @abstractmethod
++    def all_gather(
++        self,
++        comm_handle: Any,
++        input_tensor: torch.Tensor,
++        world_size: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        AllGather：收集所有进程的 tensor，拼接后返回。
++
++        Returns:
++            shape = [world_size * input_size, ...] 的拼接 tensor
++        """
++        ...
++
++    @abstractmethod
++    def reduce_scatter(
++        self,
++        comm_handle: Any,
++        input_tensor: torch.Tensor,
++        world_size: int,
++        op: ReduceOp = ReduceOp.SUM,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        ReduceScatter：先归约再分散到各进程。
++
++        Returns:
++            当前进程分到的那份 tensor
++        """
++        ...
++
++    @abstractmethod
++    def broadcast(
++        self,
++        comm_handle: Any,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        Broadcast：从 src 进程广播 tensor 到所有进程。
++        """
++        ...
++
++    @abstractmethod
++    def all_to_all(
++        self,
++        comm_handle: Any,
++        input_tensor: torch.Tensor,
++        scatter_dim: int = 0,
++        gather_dim: int = 0,
++        scatter_sizes: list[int] | None = None,
++        gather_sizes: list[int] | None = None,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        All-to-All：每个进程向每个进程发送不同的数据块。
++        """
++        ...
++
++    # ----------------------------------------------------------
++    # 点对点通信原语
++    # ----------------------------------------------------------
++
++    @abstractmethod
++    def send(
++        self,
++        comm_handle: Any,
++        tensor: torch.Tensor,
++        dst: int,
++        stream: Any = None,
++    ) -> None:
++        """点对点发送"""
++        ...
++
++    @abstractmethod
++    def recv(
++        self,
++        comm_handle: Any,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """点对点接收"""
++        ...
++
++    # ----------------------------------------------------------
++    # 同步
++    # ----------------------------------------------------------
++
++    @abstractmethod
++    def barrier(self, comm_handle: Any) -> None:
++        """组内同步屏障"""
++        ...
++
++    @abstractmethod
++    def synchronize(self, stream: Any = None) -> None:
++        """同步流上的所有操作"""
++        ...
++
++
++# ============================================================
++# CommBackend 注册表
++# ============================================================
++
++
++class CommBackendRegistry:
++    """
++    后端注册表：单例，管理所有已注册的通信后端。
++
++    使用方式:
++        # 注册
++        registry = CommBackendRegistry()
++        registry.register(NCCLBackend())
++        registry.register(HCCLBackend())
++
++        # 获取
++        backend = registry.get("nccl")
++
++        # 自动发现可用后端
++        backend = registry.get_available_backend("cuda")
++    """
++
++    _instance: CommBackendRegistry | None = None
++    _backends: dict[str, CommBackend]
++
++    def __new__(cls) -> CommBackendRegistry:
++        if cls._instance is None:
++            cls._instance = super().__new__(cls)
++            cls._instance._backends = {}
++        return cls._instance
++
++    def register(self, backend: CommBackend) -> None:
++        """注册一个通信后端"""
++        self._backends[backend.name] = backend
++
++    def get(self, name: str) -> CommBackend:
++        """按名称获取后端"""
++        if name not in self._backends:
++            available = list(self._backends.keys())
++            raise KeyError(f"Backend '{name}' not registered. Available: {available}")
++        return self._backends[name]
++
++    def get_available_backend(self, device_type: str) -> CommBackend:
++        """
++        根据设备类型自动选择可用后端。
++
++        Args:
++            device_type: 'cuda', 'npu', 'metax' 等
++
++        Returns:
++            第一个匹配且可用的后端
++        """
++        for backend in self._backends.values():
++            if backend.device_type == device_type and backend.is_available():
++                return backend
++        raise RuntimeError(
++            f"No available backend for device type '{device_type}'. "
++            f"Registered backends: {list(self._backends.keys())}"
++        )
++
++    def list_backends(self) -> list[str]:
++        """列出所有已注册后端名称"""
++        return list(self._backends.keys())
++
++
++# ============================================================
++# 便捷函数
++# ============================================================
++
++_registry = CommBackendRegistry()
++
++
++def register_backend(backend: CommBackend) -> None:
++    """注册通信后端的快捷函数"""
++    _registry.register(backend)
++
++
++def get_backend(name: str) -> CommBackend:
++    """获取通信后端的快捷函数"""
++    return _registry.get(name)
++
++
++def get_available_backend(device_type: str) -> CommBackend:
++    """根据设备类型获取可用后端的快捷函数"""
++    return _registry.get_available_backend(device_type)
+diff --git a/vllm/distributed/unified_comm/backends/__init__.py b/vllm/distributed/unified_comm/backends/__init__.py
+new file mode 100644
+index 000000000..3ae07d6d1
+--- /dev/null
++++ b/vllm/distributed/unified_comm/backends/__init__.py
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from vllm.distributed.unified_comm.backends.hccl_backend import HCCLBackend
++from vllm.distributed.unified_comm.backends.nccl_backend import NCCLBackend
++
++__all__ = ["NCCLBackend", "HCCLBackend"]
+diff --git a/vllm/distributed/unified_comm/backends/hccl_backend.py b/vllm/distributed/unified_comm/backends/hccl_backend.py
+new file mode 100644
+index 000000000..85c65e88f
+--- /dev/null
++++ b/vllm/distributed/unified_comm/backends/hccl_backend.py
+@@ -0,0 +1,875 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""HCCL backend - Huawei Ascend NPU adapter for ``CommBackend``.
++
++Adapts the Huawei Collective Communications Library (HCCL) to the
++unified :class:`CommBackend` interface. The low-level C bindings are
++reused from the existing ``pyhccl_wrapper`` shipped with vllm-hust /
++vllm-ascend-hust.
++
++Two execution modes are supported:
++  Mode A (``torch.distributed``):
++      Uses the HCCL backend through ``torch.distributed``. Recommended
++      because it is the most compatible.
++  Mode B (direct C API):
++      Calls into ``libhccl.so`` directly via the ``pyhccl_wrapper``.
++      Useful for latency-sensitive paths because it avoids implicit
++      ``torch.distributed`` overhead and gives finer-grained stream
++      control. Enabled with ``UNIFIED_COMM_USE_DIRECT_HCCL=1``.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import logging
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++import torch.distributed as dist
++
++from vllm.distributed.unified_comm.backend import (
++    CommBackend,
++    CommConfig,
++    CommGroupInfo,
++    ReduceOp,
++)
++
++logger = logging.getLogger(__name__)
++
++
++# ============================================================
++# ReduceOp 映射工具
++# ============================================================
++
++# 统一层 ReduceOp → HCCL C API 归约操作码
++_REDUCE_OP_TO_HCCL_INT = {
++    ReduceOp.SUM: 0,  # hcclSum
++    ReduceOp.PRODUCT: 1,  # hcclProd
++    ReduceOp.MAX: 2,  # hcclMax
++    ReduceOp.MIN: 3,  # hcclMin
++}
++
++
++def _reduce_op_to_hccl(op: ReduceOp) -> int:
++    """将统一 ReduceOp 转为 HCCL C API 的 int 枚举值"""
++    if op == ReduceOp.AVG:
++        raise ValueError("HCCL does not natively support AVG, use SUM + divide")
++    return _REDUCE_OP_TO_HCCL_INT[op]
++
++
++# ============================================================
++# HCCL 数据类型映射（仅 Mode B 需要）
++# ============================================================
++
++# PyTorch dtype → HCCL hcclDataType_t (int)
++# 注：具体映射值参考 HCCL 官方头文件
++_TORCH_DTYPE_TO_HCCL = {
++    torch.int8: 1,  # HCCL_DATA_TYPE_INT8
++    torch.int16: 2,  # HCCL_DATA_TYPE_INT16
++    torch.int32: 3,  # HCCL_DATA_TYPE_INT32
++    torch.float16: 4,  # HCCL_DATA_TYPE_FP16
++    torch.float32: 5,  # HCCL_DATA_TYPE_FP32
++    torch.int64: 6,  # HCCL_DATA_TYPE_INT64
++    torch.float64: 7,  # HCCL_DATA_TYPE_FP64
++    torch.bfloat16: 9,  # HCCL_DATA_TYPE_BFP16
++}
++
++
++def _import_pyhccl_wrapper():
++    """
++    Try multiple known locations for the pyhccl wrapper module.
++
++    Different vllm forks/branches put it under different namespaces:
++    1. vllm.distributed.device_communicators.pyhccl_wrapper (if vendored
++       into vllm-hust main repo)
++    2. vllm_ascend.distributed.device_communicators.pyhccl_wrapper (lives
++       in vllm-ascend-hust plugin)
++
++    Returns the imported module on success, None on failure.
++    """
++    import importlib
++
++    for mod_path in (
++        "vllm.distributed.device_communicators.pyhccl_wrapper",
++        "vllm_ascend.distributed.device_communicators.pyhccl_wrapper",
++    ):
++        try:
++            return importlib.import_module(mod_path)
++        except ImportError:
++            continue
++    return None
++
++
++def _dtype_to_hccl(dtype: torch.dtype) -> int:
++    """将 PyTorch dtype 转为 HCCL 数据类型 int"""
++    if dtype in _TORCH_DTYPE_TO_HCCL:
++        return _TORCH_DTYPE_TO_HCCL[dtype]
++    # float8 变体统一映射为 int8 传输
++    if "float8" in str(dtype):
++        return _TORCH_DTYPE_TO_HCCL[torch.int8]
++    raise ValueError(f"Unsupported dtype for HCCL: {dtype}")
++
++
++# ============================================================
++# HCCL 通信句柄
++# ============================================================
++
++
++@dataclass
++class HCCLCommHandle:
++    """
++    HCCL 通信组句柄，封装所有需要的状态。
++
++    对应关系：
++      - device_group: torch.distributed HCCL ProcessGroup (Mode A 使用)
++      - cpu_group: torch.distributed Gloo ProcessGroup (辅助 CPU 通信，如广播 unique_id)
++      - hccl_comm: hcclComm_t 原始句柄 (Mode B 使用)
++      - hccl_lib: HCCLLibrary 实例 (Mode B 使用)
++      - owns_groups: 是否拥有 ProcessGroup 的生命周期
++        （False 表示外部传入，不由我们销毁）
++    """
++
++    device_group: dist.ProcessGroup | None = None
++    cpu_group: dist.ProcessGroup | None = None
++    group_info: CommGroupInfo | None = None
++    device: torch.device | None = None
++    hccl_comm: Any = None  # hcclComm_t (ctypes.c_void_p)
++    hccl_lib: Any = None  # HCCLLibrary instance
++    use_direct: bool = False  # 是否使用直接 C API 模式
++    owns_groups: bool = True  # 是否拥有 PG 生命周期管理权
++
++
++# ============================================================
++# HCCLBackend 实现
++# ============================================================
++
++
++class HCCLBackend(CommBackend):
++    """
++    HCCL 通信后端 - 适配华为 Ascend NPU。
++
++    支持两种模式：
++      Mode A: torch.distributed HCCL 后端 (默认，兼容性好，支持所有集合原语)
++      Mode B: 直接 libhccl.so C API (低延迟，目前支持 AllReduce / Broadcast)
++
++    典型用法:
++        from vllm.distributed.unified_comm.backend import register_backend
++        from vllm.distributed.unified_comm.backends.hccl_backend import HCCLBackend
++
++        # Mode A (默认)
++        register_backend(HCCLBackend())
++
++        # Mode B (直接 C API)
++        register_backend(HCCLBackend(use_direct_hccl=True))
++
++    与 NCCL 后端的主要区别：
++      1. 设备管理使用 torch.npu 而非 torch.cuda
++      2. Stream 通过 torch_npu 的 current_stream 获取
++      3. ProcessGroup 后端名称为 "hccl" 而非 "nccl"
++      4. HCCL 不原生支持 AVG 归约操作
++      5. All-to-All 和点对点通信目前仅支持 Mode A (torch.distributed)
++    """
++
++    def __init__(self, use_direct_hccl: bool = False, library_path: str | None = None):
++        """
++        Args:
++            use_direct_hccl: True 时使用直接 C API 模式 (Mode B)
++            library_path: HCCL 库路径 (None 则自动查找)
++        """
++        self._use_direct_hccl = use_direct_hccl
++        self._library_path = library_path
++
++    @property
++    def name(self) -> str:
++        return "hccl"
++
++    @property
++    def device_type(self) -> str:
++        return "npu"
++
++    def is_available(self) -> bool:
++        """检查当前环境是否有 NPU + HCCL"""
++        try:
++            import torch_npu  # noqa: F401
++
++            return torch.npu.is_available()
++        except (ImportError, AttributeError):
++            return False
++
++    # ----------------------------------------------------------
++    # 生命周期管理
++    # ----------------------------------------------------------
++
++    def init_comm_group(
++        self, group_info: CommGroupInfo, config: CommConfig
++    ) -> HCCLCommHandle:
++        """
++        初始化 HCCL 通信组。
++
++        支持两种模式：
++        A) 复用已有 ProcessGroup（通过 config.extra 传入）—— 推荐
++           config.extra["existing_device_group"] = <已创建的 HCCL PG>
++           config.extra["existing_cpu_group"] = <已创建的 Gloo PG>
++
++        B) 新建 ProcessGroup（默认行为）
++
++        Args:
++            group_info: 通信组描述
++            config: 通信配置
++                - config.extra["group_name"]: HCCL ProcessGroup 名称 (可选)
++                - config.extra["existing_device_group"]: 可选，已有的 HCCL PG
++                - config.extra["existing_cpu_group"]: 可选，已有的 Gloo PG
++
++        Returns:
++            HCCLCommHandle: 通信句柄
++        """
++        import torch_npu  # noqa: F401 - 确保 torch_npu 已加载
++
++        group_name = config.extra.get("group_name", "unified_comm")
++
++        # 优先复用已有的 ProcessGroup，避免重复创建导致死锁
++        existing_device_group = config.extra.get("existing_device_group", None)
++        existing_cpu_group = config.extra.get("existing_cpu_group", None)
++
++        if existing_device_group is not None and existing_cpu_group is not None:
++            # 模式 A：复用已有 PG
++            device_group = existing_device_group
++            cpu_group = existing_cpu_group
++            owns_groups = False
++        else:
++            # 模式 B：新建 PG
++            device_group = self._create_device_group(group_info.ranks, group_name)
++            cpu_group = dist.new_group(ranks=group_info.ranks, backend="gloo")
++            owns_groups = True
++
++        # [可选] 初始化直接 HCCL C API
++        hccl_comm = None
++        hccl_lib = None
++        if self._use_direct_hccl:
++            hccl_comm, hccl_lib = self._init_direct_hccl(
++                group_info=group_info,
++                cpu_group=cpu_group,
++                config=config,
++            )
++
++        handle = HCCLCommHandle(
++            device_group=device_group,
++            cpu_group=cpu_group,
++            group_info=group_info,
++            device=group_info.device,
++            hccl_comm=hccl_comm,
++            hccl_lib=hccl_lib,
++            use_direct=self._use_direct_hccl and hccl_comm is not None,
++            owns_groups=owns_groups,
++        )
++
++        logger.info(
++            "HCCL comm group initialized: rank=%d, world_size=%d, mode=%s",
++            group_info.rank_in_group,
++            group_info.world_size,
++            "direct" if handle.use_direct else "torch.distributed",
++        )
++
++        return handle
++
++    def _create_device_group(
++        self, ranks: list[int], group_name: str
++    ) -> dist.ProcessGroup:
++        """
++        创建 HCCL ProcessGroup。
++
++        尝试使用项目中已有的 HCCL pg_options 逻辑（如果可用），
++        否则使用默认参数创建。
++        """
++        try:
++            # 尝试使用 vllm 中可能存在的 HCCL 配置工具
++            from vllm.platforms import current_platform
++
++            pg_options = current_platform.create_hccl_pg_options(group_name)
++            device_group = dist.new_group(
++                ranks=ranks,
++                backend="hccl",
++                pg_options=pg_options,
++            )
++        except (ImportError, AttributeError):
++            # Fallback: 直接创建，不带额外选项
++            device_group = dist.new_group(
++                ranks=ranks,
++                backend="hccl",
++            )
++
++        return device_group
++
++    def _init_direct_hccl(
++        self,
++        group_info: CommGroupInfo,
++        cpu_group: dist.ProcessGroup,
++        config: CommConfig,
++    ) -> tuple[Any, Any]:
++        """
++        初始化直接 HCCL C API 通信。
++
++        复刻自 PyHcclCommunicator.__init__() 的逻辑：
++        1. 加载 libhccl.so (通过 HCCLLibrary)
++        2. rank 0 生成 hcclUniqueId
++        3. 通过 Gloo (cpu_group) 广播 unique_id 到所有 rank
++        4. 所有 rank 调用 hcclCommInitRank
++        5. 做一次 warmup all_reduce
++        """
++        try:
++            mod = _import_pyhccl_wrapper()
++            if mod is None:
++                raise ImportError("pyhccl_wrapper not found")
++            HCCLLibrary = mod.HCCLLibrary
++            aclrtStream_t = mod.aclrtStream_t
++            buffer_type = mod.buffer_type
++            hcclDataTypeEnum = mod.hcclDataTypeEnum
++            hcclUniqueId = mod.hcclUniqueId
++        except ImportError:
++            logger.warning(
++                "Cannot import pyhccl_wrapper from any known location "
++                "(vllm.distributed.device_communicators / "
++                "vllm_ascend.distributed.device_communicators). "
++                "Direct HCCL C API mode requires the HCCL wrapper to be available. "
++                "Falling back to torch.distributed mode."
++            )
++            return None, None
++
++        # 确定库路径
++        library_path = config.library_path or self._library_path
++        try:
++            # HCCLLibrary 内部会自动 find_hccl_library() 如果传 None
++            hccl_lib = HCCLLibrary(library_path)
++        except Exception as e:
++            logger.warning(
++                "Failed to load HCCL library: %s. "
++                "Falling back to torch.distributed mode.",
++                e,
++            )
++            return None, None
++
++        device = group_info.device
++        logger.info(
++            "Initializing direct HCCL comm: rank=%d, world_size=%d, device=%s",
++            group_info.rank_in_group,
++            group_info.world_size,
++            device,
++        )
++
++        # --- 生成 / 广播 UniqueId ---
++        if group_info.rank_in_group == 0:
++            with torch.npu.device(device):
++                unique_id = hccl_lib.hcclGetUniqueId()
++        else:
++            unique_id = hcclUniqueId()
++
++        # 将 unique_id 序列化为 ByteTensor，通过 Gloo cpu_group 广播
++        # hcclUniqueId.internal 是 ctypes.c_byte * 4108
++        tensor = torch.ByteTensor(list(unique_id.internal))
++        # 注意：dist.broadcast 的 src 需要全局 rank
++        dist.broadcast(tensor, src=group_info.ranks[0], group=cpu_group)
++        byte_list = tensor.tolist()
++        for i, byte_val in enumerate(byte_list):
++            unique_id.internal[i] = byte_val
++
++        # --- 初始化 HCCL Communicator ---
++        with torch.npu.device(device):
++            hccl_comm = hccl_lib.hcclCommInitRank(
++                group_info.world_size, unique_id, group_info.rank_in_group
++            )
++
++        # --- Warmup: 一次 small AllReduce 确保通信链路就绪 ---
++        with torch.npu.device(device):
++            stream = torch.npu.current_stream(device)
++            warmup_data = torch.zeros(1, device=device)
++            hccl_lib.hcclAllReduce(
++                buffer_type(warmup_data.data_ptr()),
++                buffer_type(warmup_data.data_ptr()),  # in-place
++                warmup_data.numel(),
++                hcclDataTypeEnum.from_torch(warmup_data.dtype),
++                0,  # hcclSum
++                hccl_comm,
++                aclrtStream_t(stream.npu_stream),
++            )
++            stream.synchronize()
++            del warmup_data
++
++        logger.info(
++            "Direct HCCL comm initialized and warmed up for rank %d",
++            group_info.rank_in_group,
++        )
++        return hccl_comm, hccl_lib
++
++    def destroy_comm_group(self, comm_handle: HCCLCommHandle) -> None:
++        """销毁通信组，释放所有资源"""
++        # 销毁直接 HCCL comm (如果有)
++        if comm_handle.hccl_comm is not None and comm_handle.hccl_lib is not None:
++            try:
++                comm_handle.hccl_lib.hcclCommDestroy(comm_handle.hccl_comm)
++            except Exception as e:
++                logger.warning("Failed to destroy HCCL comm: %s", e)
++
++        # 只有当我们拥有 PG 生命周期时才销毁
++        # 如果是外部传入的 PG（owns_groups=False），由外部管理生命周期
++        if comm_handle.owns_groups:
++            if comm_handle.device_group is not None:
++                with contextlib.suppress(Exception):
++                    dist.destroy_process_group(comm_handle.device_group)
++            if comm_handle.cpu_group is not None:
++                with contextlib.suppress(Exception):
++                    dist.destroy_process_group(comm_handle.cpu_group)
++
++    # ----------------------------------------------------------
++    # 集合通信原语
++    # ----------------------------------------------------------
++
++    def all_reduce(
++        self,
++        comm_handle: HCCLCommHandle,
++        input_tensor: torch.Tensor,
++        op: ReduceOp = ReduceOp.SUM,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        AllReduce: 所有 rank 归约 tensor，结果写回所有 rank。
++
++        - Mode B (direct): 调用 libhccl.so hcclAllReduce，返回新 tensor
++        - Mode A (torch.distributed): 调用 dist.all_reduce (in-place)
++
++        注意：Mode A 采用 in-place 语义，与 vLLM GroupCoordinator.all_reduce 一致。
++        """
++        if comm_handle.use_direct:
++            return self._all_reduce_direct(comm_handle, input_tensor, op, stream)
++
++        # Mode A: torch.distributed — in-place all_reduce
++        dist.all_reduce(input_tensor, op=op.to_torch(), group=comm_handle.device_group)
++        return input_tensor
++
++    def _all_reduce_direct(
++        self,
++        comm_handle: HCCLCommHandle,
++        input_tensor: torch.Tensor,
++        op: ReduceOp,
++        stream: Any,
++    ) -> torch.Tensor:
++        """直接调用 HCCL C API 的 AllReduce（对齐 PyHcclCommunicator.all_reduce）"""
++        _pyhccl_mod = _import_pyhccl_wrapper()
++        aclrtStream_t = _pyhccl_mod.aclrtStream_t
++        buffer_type = _pyhccl_mod.buffer_type
++        hcclDataTypeEnum = _pyhccl_mod.hcclDataTypeEnum
++
++        # 设备检查
++        assert input_tensor.device == comm_handle.device, (
++            f"HCCL communicator bound to {comm_handle.device}, "
++            f"but input tensor is on {input_tensor.device}"
++        )
++
++        out_tensor = torch.empty_like(input_tensor)
++
++        if stream is None:
++            stream = torch.npu.current_stream(comm_handle.device)
++
++        comm_handle.hccl_lib.hcclAllReduce(
++            buffer_type(input_tensor.data_ptr()),
++            buffer_type(out_tensor.data_ptr()),
++            input_tensor.numel(),
++            hcclDataTypeEnum.from_torch(input_tensor.dtype),
++            _reduce_op_to_hccl(op),
++            comm_handle.hccl_comm,
++            aclrtStream_t(stream.npu_stream),
++        )
++        return out_tensor
++
++    def all_gather(
++        self,
++        comm_handle: HCCLCommHandle,
++        input_tensor: torch.Tensor,
++        world_size: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        AllGather: 收集所有 rank 的 tensor，拼接返回。
++
++        输出 shape: [world_size * input_dim0, ...]
++
++        注：目前 HCCL 直接 C API 未完整导出 AllGather，统一走 torch.distributed。
++        """
++        if comm_handle.use_direct:
++            return self._all_gather_direct(
++                comm_handle, input_tensor, world_size, stream
++            )
++
++        # Mode A: torch.distributed
++        input_size = list(input_tensor.shape)
++        output_size = [input_size[0] * world_size] + input_size[1:]
++        output_tensor = torch.empty(
++            output_size, dtype=input_tensor.dtype, device=input_tensor.device
++        )
++        dist.all_gather_into_tensor(
++            output_tensor, input_tensor, group=comm_handle.device_group
++        )
++        return output_tensor
++
++    def _all_gather_direct(
++        self,
++        comm_handle: HCCLCommHandle,
++        input_tensor: torch.Tensor,
++        world_size: int,
++        stream: Any,
++    ) -> torch.Tensor:
++        """
++        直接调用 HCCL C API 的 AllGather。
++
++        如果 HCCL wrapper 不支持此操作，回退到 torch.distributed。
++        """
++        try:
++            _pyhccl_mod = _import_pyhccl_wrapper()
++            if _pyhccl_mod is None:
++                raise ImportError("pyhccl_wrapper not found")
++            aclrtStream_t = _pyhccl_mod.aclrtStream_t
++            buffer_type = _pyhccl_mod.buffer_type
++            hcclDataTypeEnum = _pyhccl_mod.hcclDataTypeEnum
++        except ImportError:
++            # Fallback to torch.distributed
++            return self.all_gather.__wrapped__(
++                self, comm_handle, input_tensor, world_size, None
++            )
++
++        assert input_tensor.device == comm_handle.device
++
++        input_size = list(input_tensor.shape)
++        output_size = [input_size[0] * world_size] + input_size[1:]
++        output_tensor = torch.empty(
++            output_size, dtype=input_tensor.dtype, device=input_tensor.device
++        )
++
++        if stream is None:
++            stream = torch.npu.current_stream(comm_handle.device)
++
++        try:
++            # hcclAllGather 的 count 参数是 sendcount (每个 rank 贡献的元素数)
++            comm_handle.hccl_lib.hcclAllGather(
++                buffer_type(input_tensor.data_ptr()),
++                buffer_type(output_tensor.data_ptr()),
++                input_tensor.numel(),
++                hcclDataTypeEnum.from_torch(input_tensor.dtype),
++                comm_handle.hccl_comm,
++                aclrtStream_t(stream.npu_stream),
++            )
++        except (AttributeError, NotImplementedError):
++            # 如果 HCCL 版本不支持 AllGather C API，回退到 torch.distributed
++            logger.debug(
++                "HCCL C API AllGather not available, falling back to torch.distributed"
++            )
++            dist.all_gather_into_tensor(
++                output_tensor, input_tensor, group=comm_handle.device_group
++            )
++
++        return output_tensor
++
++    def reduce_scatter(
++        self,
++        comm_handle: HCCLCommHandle,
++        input_tensor: torch.Tensor,
++        world_size: int,
++        op: ReduceOp = ReduceOp.SUM,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        ReduceScatter: 先归约再分散，每个 rank 得到 1/world_size 的结果。
++
++        输入 shape: [N, ...]，要求 N % world_size == 0
++        输出 shape: [N // world_size, ...]
++
++        注：目前统一走 torch.distributed。HCCL C API 的 ReduceScatter 在未来版本中支持。
++        """
++        if comm_handle.use_direct:
++            return self._reduce_scatter_direct(
++                comm_handle, input_tensor, world_size, op, stream
++            )
++
++        # Mode A: torch.distributed
++        input_size = list(input_tensor.shape)
++        assert input_size[0] % world_size == 0, (
++            f"ReduceScatter requires dim0 ({input_size[0]}) "
++            f"divisible by world_size ({world_size})"
++        )
++        output_size = [input_size[0] // world_size] + input_size[1:]
++        output_tensor = torch.empty(
++            output_size, dtype=input_tensor.dtype, device=input_tensor.device
++        )
++        dist.reduce_scatter_tensor(
++            output_tensor,
++            input_tensor,
++            op=op.to_torch(),
++            group=comm_handle.device_group,
++        )
++        return output_tensor
++
++    def _reduce_scatter_direct(
++        self,
++        comm_handle: HCCLCommHandle,
++        input_tensor: torch.Tensor,
++        world_size: int,
++        op: ReduceOp,
++        stream: Any,
++    ) -> torch.Tensor:
++        """
++        直接调用 HCCL C API 的 ReduceScatter。
++
++        如果 HCCL wrapper 不支持此操作，回退到 torch.distributed。
++        """
++        try:
++            _pyhccl_mod = _import_pyhccl_wrapper()
++            if _pyhccl_mod is None:
++                raise ImportError("pyhccl_wrapper not found")
++            aclrtStream_t = _pyhccl_mod.aclrtStream_t
++            buffer_type = _pyhccl_mod.buffer_type
++            hcclDataTypeEnum = _pyhccl_mod.hcclDataTypeEnum
++        except ImportError:
++            input_size = list(input_tensor.shape)
++            output_size = [input_size[0] // world_size] + input_size[1:]
++            output_tensor = torch.empty(
++                output_size, dtype=input_tensor.dtype, device=input_tensor.device
++            )
++            dist.reduce_scatter_tensor(
++                output_tensor,
++                input_tensor,
++                op=op.to_torch(),
++                group=comm_handle.device_group,
++            )
++            return output_tensor
++
++        assert input_tensor.device == comm_handle.device
++        input_size = list(input_tensor.shape)
++        assert input_size[0] % world_size == 0
++
++        output_size = [input_size[0] // world_size] + input_size[1:]
++        output_tensor = torch.empty(
++            output_size, dtype=input_tensor.dtype, device=input_tensor.device
++        )
++
++        if stream is None:
++            stream = torch.npu.current_stream(comm_handle.device)
++
++        try:
++            # hcclReduceScatter 的 count 参数是 recvcount
++            comm_handle.hccl_lib.hcclReduceScatter(
++                buffer_type(input_tensor.data_ptr()),
++                buffer_type(output_tensor.data_ptr()),
++                output_tensor.numel(),
++                hcclDataTypeEnum.from_torch(input_tensor.dtype),
++                _reduce_op_to_hccl(op),
++                comm_handle.hccl_comm,
++                aclrtStream_t(stream.npu_stream),
++            )
++        except (AttributeError, NotImplementedError):
++            logger.debug(
++                "HCCL C API ReduceScatter not available, "
++                "falling back to torch.distributed"
++            )
++            dist.reduce_scatter_tensor(
++                output_tensor,
++                input_tensor,
++                op=op.to_torch(),
++                group=comm_handle.device_group,
++            )
++
++        return output_tensor
++
++    def broadcast(
++        self,
++        comm_handle: HCCLCommHandle,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        Broadcast: 从 src rank 广播 tensor 到所有 rank。
++
++        注意: src 是组内 rank (0-based)，不是全局 rank。
++
++        - Mode B (direct): 调用 libhccl.so hcclBroadcast (in-place)
++        - Mode A (torch.distributed): 调用 dist.broadcast
++        """
++        if comm_handle.use_direct:
++            return self._broadcast_direct(comm_handle, tensor, src, stream)
++
++        # Mode A: torch.distributed
++        # dist.broadcast 需要全局 rank
++        global_src = comm_handle.group_info.ranks[src]
++        dist.broadcast(tensor, src=global_src, group=comm_handle.device_group)
++        return tensor
++
++    def _broadcast_direct(
++        self,
++        comm_handle: HCCLCommHandle,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any,
++    ) -> torch.Tensor:
++        """直接调用 HCCL C API 的 Broadcast（对齐 PyHcclCommunicator.broadcast）"""
++        _pyhccl_mod = _import_pyhccl_wrapper()
++        aclrtStream_t = _pyhccl_mod.aclrtStream_t
++        buffer_type = _pyhccl_mod.buffer_type
++        hcclDataTypeEnum = _pyhccl_mod.hcclDataTypeEnum
++
++        assert tensor.device == comm_handle.device, (
++            f"HCCL communicator bound to {comm_handle.device}, "
++            f"but tensor is on {tensor.device}"
++        )
++
++        if stream is None:
++            stream = torch.npu.current_stream(comm_handle.device)
++
++        comm_handle.hccl_lib.hcclBroadcast(
++            buffer_type(tensor.data_ptr()),
++            tensor.numel(),
++            hcclDataTypeEnum.from_torch(tensor.dtype),
++            src,  # HCCL Broadcast 接受组内 rank
++            comm_handle.hccl_comm,
++            aclrtStream_t(stream.npu_stream),
++        )
++        return tensor
++
++    def all_to_all(
++        self,
++        comm_handle: HCCLCommHandle,
++        input_tensor: torch.Tensor,
++        scatter_dim: int = 0,
++        gather_dim: int = 0,
++        scatter_sizes: list[int] | None = None,
++        gather_sizes: list[int] | None = None,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        All-to-All: 每个 rank 向每个 rank 发送不同块。
++
++        支持均匀切分和非均匀切分 (通过 scatter_sizes/gather_sizes)。
++
++        注：HCCL 目前仅通过 torch.distributed 支持 all_to_all，
++        无直接 C API 路径。对齐 NPUCommunicator.all_to_all() 的逻辑。
++        """
++        world_size = comm_handle.group_info.world_size
++
++        # 处理负维度
++        if scatter_dim < 0:
++            scatter_dim += input_tensor.dim()
++        if gather_dim < 0:
++            gather_dim += input_tensor.dim()
++
++        if scatter_sizes is not None and gather_sizes is not None:
++            # 非均匀切分
++            input_list = [
++                t.contiguous()
++                for t in torch.split(input_tensor, scatter_sizes, scatter_dim)
++            ]
++            rank = comm_handle.group_info.rank_in_group
++            output_list = []
++            tensor_shape_base = list(input_list[rank].shape)
++            for i in range(world_size):
++                tensor_shape = list(tensor_shape_base)
++                tensor_shape[gather_dim] = gather_sizes[i]
++                output_list.append(
++                    torch.empty(
++                        tensor_shape,
++                        dtype=input_tensor.dtype,
++                        device=input_tensor.device,
++                    )
++                )
++        else:
++            # 均匀切分
++            input_list = [
++                t.contiguous()
++                for t in torch.tensor_split(input_tensor, world_size, scatter_dim)
++            ]
++            output_list = [torch.empty_like(input_list[i]) for i in range(world_size)]
++
++        dist.all_to_all(output_list, input_list, group=comm_handle.device_group)
++        return torch.cat(output_list, dim=gather_dim).contiguous()
++
++    # ----------------------------------------------------------
++    # 点对点通信
++    # ----------------------------------------------------------
++
++    def send(
++        self,
++        comm_handle: HCCLCommHandle,
++        tensor: torch.Tensor,
++        dst: int,
++        stream: Any = None,
++    ) -> None:
++        """
++        点对点发送。
++
++        dst: 组内 rank (0-based)
++
++        注：目前 HCCL 的 P2P 统一通过 torch.distributed 完成。
++        HCCL C API 层面的 send/recv 在 CANN 版本 >= 7.0 中支持。
++        """
++        global_dst = comm_handle.group_info.ranks[dst]
++        dist.send(tensor, dst=global_dst, group=comm_handle.device_group)
++
++    def recv(
++        self,
++        comm_handle: HCCLCommHandle,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        点对点接收。
++
++        src: 组内 rank (0-based)
++        tensor: 预分配的接收 buffer
++        """
++        global_src = comm_handle.group_info.ranks[src]
++        dist.recv(tensor, src=global_src, group=comm_handle.device_group)
++        return tensor
++
++    # ----------------------------------------------------------
++    # 同步
++    # ----------------------------------------------------------
++
++    def barrier(self, comm_handle: HCCLCommHandle) -> None:
++        """组内同步屏障"""
++        dist.barrier(group=comm_handle.device_group)
++
++    def synchronize(self, stream: Any = None) -> None:
++        """
++        同步 NPU stream 上的所有操作。
++
++        如果不传 stream，则同步当前设备的默认 stream。
++        """
++        if stream is not None:
++            stream.synchronize()
++        else:
++            torch.npu.synchronize()
++
++    # ----------------------------------------------------------
++    # 高级功能：批量 Send/Recv (未来扩展)
++    # ----------------------------------------------------------
++
++    def batch_send_recv(
++        self,
++        comm_handle: HCCLCommHandle,
++        send_list: list[tuple[torch.Tensor, int]],
++        recv_list: list[tuple[torch.Tensor, int]],
++        stream: Any = None,
++    ) -> None:
++        """
++        批量 Send/Recv 操作。
++
++        当前实现：逐个调用 send/recv。
++        未来（CANN >= 7.0）可升级为使用 hcclGroupStart/hcclGroupEnd 合并操作。
++
++        Args:
++            send_list: [(tensor, dst_rank), ...] 要发送的 tensor 和目标 rank 列表
++            recv_list: [(tensor, src_rank), ...] 要接收的 tensor 和来源 rank 列表
++            stream: 可选 NPU stream
++        """
++        for tensor, dst in send_list:
++            self.send(comm_handle, tensor, dst, stream)
++        for tensor, src in recv_list:
++            self.recv(comm_handle, tensor, src, stream)
+diff --git a/vllm/distributed/unified_comm/backends/nccl_backend.py b/vllm/distributed/unified_comm/backends/nccl_backend.py
+new file mode 100644
+index 000000000..62df50638
+--- /dev/null
++++ b/vllm/distributed/unified_comm/backends/nccl_backend.py
+@@ -0,0 +1,900 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""NCCL backend - NVIDIA GPU adapter for ``CommBackend``.
++
++Adapts the NVIDIA Collective Communications Library (NCCL) to the
++unified :class:`CommBackend` interface. The implementation mirrors
++the call-pattern used by vLLM upstream's ``pynccl.py`` /
++``pynccl_wrapper.py``.
++
++Two execution modes are supported:
++  Mode A (``torch.distributed``):
++      Uses the NCCL backend through ``torch.distributed``. Recommended
++      for general use.
++  Mode B (direct C API):
++      Calls into ``libnccl.so`` directly. Required for the CUDA-graph
++      capture path. Enabled with ``UNIFIED_COMM_USE_DIRECT_NCCL=1``.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import logging
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++import torch.distributed as dist
++
++from vllm.distributed.unified_comm.backend import (
++    CommBackend,
++    CommConfig,
++    CommGroupInfo,
++    ReduceOp,
++)
++
++logger = logging.getLogger(__name__)
++
++
++# ============================================================
++# ReduceOp 映射工具
++# ============================================================
++
++# 统一层 ReduceOp → NCCL C API 归约操作码
++_REDUCE_OP_TO_NCCL_INT = {
++    ReduceOp.SUM: 0,  # ncclSum
++    ReduceOp.PRODUCT: 1,  # ncclProd
++    ReduceOp.MAX: 2,  # ncclMax
++    ReduceOp.MIN: 3,  # ncclMin
++    ReduceOp.AVG: 4,  # ncclAvg
++}
++
++
++def _reduce_op_to_nccl(op: ReduceOp) -> int:
++    """将统一 ReduceOp 转为 NCCL C API 的 int 枚举值"""
++    return _REDUCE_OP_TO_NCCL_INT[op]
++
++
++# ============================================================
++# NCCL 通信句柄
++# ============================================================
++
++
++@dataclass
++class NCCLCommHandle:
++    """
++    NCCL 通信组句柄，封装所有需要的状态。
++
++    对应关系：
++      - device_group: torch.distributed NCCL ProcessGroup (Mode A 使用)
++      - cpu_group: torch.distributed Gloo ProcessGroup (辅助 CPU 通信)
++      - nccl_comm: ncclComm_t 原始句柄 (Mode B 使用)
++      - nccl_lib: NCCLLibrary 实例 (Mode B 使用)
++      - owns_groups: 是否拥有 ProcessGroup 的生命周期
++    """
++
++    device_group: dist.ProcessGroup | None = None
++    cpu_group: dist.ProcessGroup | None = None
++    group_info: CommGroupInfo | None = None
++    device: torch.device | None = None
++    nccl_comm: Any = None  # ncclComm_t (ctypes.c_void_p)
++    nccl_lib: Any = None  # NCCLLibrary instance
++    use_direct: bool = False  # 是否使用直接 C API 模式
++    owns_groups: bool = True  # 是否拥有 PG 生命周期管理权
++
++
++# ============================================================
++# NCCLBackend 实现
++# ============================================================
++
++
++class NCCLBackend(CommBackend):
++    """
++    NCCL 通信后端 - 适配 NVIDIA GPU。
++
++    支持两种模式：
++      Mode A: torch.distributed NCCL 后端 (默认，兼容性好)
++      Mode B: 直接 libnccl.so C API (CUDA Graph 场景必需)
++
++    典型用法:
++        from vllm.distributed.unified_comm.backend import register_backend
++        from vllm.distributed.unified_comm.backends.nccl_backend import (
++            NCCLBackend,
++        )
++
++        # Mode A (默认)
++        register_backend(NCCLBackend())
++
++        # Mode B (直接 C API，用于 CUDA Graph)
++        register_backend(NCCLBackend(use_direct_nccl=True))
++    """
++
++    def __init__(
++        self,
++        use_direct_nccl: bool = False,
++        library_path: str | None = None,
++    ):
++        """
++        Args:
++            use_direct_nccl: True 时使用直接 C API 模式 (Mode B)
++            library_path: NCCL 库路径 (None 则自动查找 libnccl.so)
++        """
++        self._use_direct_nccl = use_direct_nccl
++        self._library_path = library_path
++
++    @property
++    def name(self) -> str:
++        return "nccl"
++
++    @property
++    def device_type(self) -> str:
++        return "cuda"
++
++    def is_available(self) -> bool:
++        """检查当前环境是否有 CUDA + NCCL"""
++        try:
++            return torch.cuda.is_available() and dist.is_nccl_available()
++        except Exception:
++            return False
++
++    # ----------------------------------------------------------
++    # 生命周期管理
++    # ----------------------------------------------------------
++
++    def init_comm_group(
++        self, group_info: CommGroupInfo, config: CommConfig
++    ) -> NCCLCommHandle:
++        """
++        初始化 NCCL 通信组。
++
++        支持两种模式：
++        A) 复用已有 ProcessGroup（通过 config.extra 传入）
++        B) 新建 ProcessGroup（默认行为）
++        """
++        existing_device_group = config.extra.get("existing_device_group", None)
++        existing_cpu_group = config.extra.get("existing_cpu_group", None)
++
++        if existing_device_group is not None and existing_cpu_group is not None:
++            device_group = existing_device_group
++            cpu_group = existing_cpu_group
++            owns_groups = False
++        else:
++            device_group = dist.new_group(
++                ranks=group_info.ranks,
++                backend="nccl",
++            )
++            cpu_group = dist.new_group(
++                ranks=group_info.ranks,
++                backend="gloo",
++            )
++            owns_groups = True
++
++        # [可选] 初始化直接 NCCL C API
++        nccl_comm = None
++        nccl_lib = None
++        if self._use_direct_nccl:
++            nccl_comm, nccl_lib = self._init_direct_nccl(
++                group_info=group_info,
++                cpu_group=cpu_group,
++                config=config,
++            )
++
++        handle = NCCLCommHandle(
++            device_group=device_group,
++            cpu_group=cpu_group,
++            group_info=group_info,
++            device=group_info.device,
++            nccl_comm=nccl_comm,
++            nccl_lib=nccl_lib,
++            use_direct=(self._use_direct_nccl and nccl_comm is not None),
++            owns_groups=owns_groups,
++        )
++
++        return handle
++
++    def _init_direct_nccl(
++        self,
++        group_info: CommGroupInfo,
++        cpu_group: dist.ProcessGroup,
++        config: CommConfig,
++    ) -> tuple[Any, Any]:
++        """
++        初始化直接 NCCL C API 通信。
++
++        复刻 vLLM 上游 PyNcclCommunicator.__init__() 的逻辑：
++        1. 加载 libnccl.so
++        2. rank 0 生成 ncclUniqueId
++        3. 通过 Gloo 广播 unique_id
++        4. 所有 rank 调用 ncclCommInitRank
++        5. warmup all_reduce
++        """
++        try:
++            from vllm.distributed.device_communicators.pynccl_wrapper import (
++                NCCLLibrary,
++                buffer_type,
++                cudaStream_t,
++                ncclDataTypeEnum,
++                ncclRedOpTypeEnum,
++                ncclUniqueId,
++            )
++        except ImportError:
++            logger.warning(
++                "Cannot import pynccl_wrapper. "
++                "Direct NCCL C API mode requires vllm internals. "
++                "Falling back to torch.distributed mode."
++            )
++            return None, None
++
++        library_path = config.library_path or self._library_path
++        try:
++            nccl_lib = NCCLLibrary(library_path)
++        except Exception as e:
++            logger.warning(
++                "Failed to load NCCL library: %s. "
++                "Falling back to torch.distributed mode.",
++                e,
++            )
++            return None, None
++
++        device = group_info.device
++        logger.info(
++            "Initializing direct NCCL comm: rank=%d, world_size=%d, device=%s",
++            group_info.rank_in_group,
++            group_info.world_size,
++            device,
++        )
++
++        # 生成 / 广播 UniqueId
++        if group_info.rank_in_group == 0:
++            unique_id = nccl_lib.ncclGetUniqueId()
++            nccl_version = nccl_lib.ncclGetVersion()
++            logger.info("NCCL version: %s", nccl_version)
++        else:
++            unique_id = ncclUniqueId()
++
++        tensor = torch.ByteTensor(list(unique_id.internal))
++        dist.broadcast(tensor, src=group_info.ranks[0], group=cpu_group)
++        byte_list = tensor.tolist()
++        for i, byte_val in enumerate(byte_list):
++            unique_id.internal[i] = byte_val
++
++        # 初始化 NCCL Communicator
++        with torch.cuda.device(device):
++            nccl_comm = nccl_lib.ncclCommInitRank(
++                group_info.world_size, unique_id, group_info.rank_in_group
++            )
++
++        # Warmup
++        with torch.cuda.device(device):
++            stream = torch.cuda.current_stream(device)
++            warmup_data = torch.zeros(1, device=device)
++            nccl_lib.ncclAllReduce(
++                buffer_type(warmup_data.data_ptr()),
++                buffer_type(warmup_data.data_ptr()),
++                warmup_data.numel(),
++                ncclDataTypeEnum.from_torch(warmup_data.dtype),
++                ncclRedOpTypeEnum.from_torch(dist.ReduceOp.SUM),
++                nccl_comm,
++                cudaStream_t(stream.cuda_stream),
++            )
++            stream.synchronize()
++            del warmup_data
++
++        logger.info(
++            "Direct NCCL comm initialized for rank %d",
++            group_info.rank_in_group,
++        )
++        return nccl_comm, nccl_lib
++
++    def destroy_comm_group(self, comm_handle: NCCLCommHandle) -> None:
++        """销毁通信组，释放所有资源"""
++        if comm_handle.nccl_comm is not None and comm_handle.nccl_lib is not None:
++            try:
++                with torch.cuda.device(comm_handle.device):
++                    comm_handle.nccl_lib.ncclCommDestroy(comm_handle.nccl_comm)
++            except Exception as e:
++                logger.warning("Failed to destroy NCCL comm: %s", e)
++
++        if comm_handle.owns_groups:
++            if comm_handle.device_group is not None:
++                with contextlib.suppress(Exception):
++                    dist.destroy_process_group(comm_handle.device_group)
++            if comm_handle.cpu_group is not None:
++                with contextlib.suppress(Exception):
++                    dist.destroy_process_group(comm_handle.cpu_group)
++
++    # ----------------------------------------------------------
++    # 集合通信原语
++    # ----------------------------------------------------------
++
++    def all_reduce(
++        self,
++        comm_handle: NCCLCommHandle,
++        input_tensor: torch.Tensor,
++        op: ReduceOp = ReduceOp.SUM,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """AllReduce: 所有 rank 归约 tensor，结果写回所有 rank。"""
++        if comm_handle.use_direct:
++            return self._all_reduce_direct(comm_handle, input_tensor, op, stream)
++
++        # Mode A: torch.distributed — in-place all_reduce
++        dist.all_reduce(input_tensor, op=op.to_torch(), group=comm_handle.device_group)
++        return input_tensor
++
++    def _all_reduce_direct(
++        self,
++        comm_handle: NCCLCommHandle,
++        input_tensor: torch.Tensor,
++        op: ReduceOp,
++        stream: Any,
++    ) -> torch.Tensor:
++        """直接调用 NCCL C API 的 AllReduce"""
++        from vllm.distributed.device_communicators.pynccl_wrapper import (
++            buffer_type,
++            cudaStream_t,
++            ncclDataTypeEnum,
++        )
++
++        assert input_tensor.device == comm_handle.device
++
++        out_tensor = torch.empty_like(input_tensor)
++
++        if stream is None:
++            stream = torch.cuda.current_stream(comm_handle.device)
++
++        comm_handle.nccl_lib.ncclAllReduce(
++            buffer_type(input_tensor.data_ptr()),
++            buffer_type(out_tensor.data_ptr()),
++            input_tensor.numel(),
++            ncclDataTypeEnum.from_torch(input_tensor.dtype),
++            _reduce_op_to_nccl(op),
++            comm_handle.nccl_comm,
++            cudaStream_t(stream.cuda_stream),
++        )
++        return out_tensor
++
++    def all_gather(
++        self,
++        comm_handle: NCCLCommHandle,
++        input_tensor: torch.Tensor,
++        world_size: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """AllGather: 收集所有 rank 的 tensor，拼接返回。"""
++        if comm_handle.use_direct:
++            return self._all_gather_direct(
++                comm_handle, input_tensor, world_size, stream
++            )
++
++        # Mode A: torch.distributed
++        input_size = list(input_tensor.shape)
++        output_size = [input_size[0] * world_size] + input_size[1:]
++        output_tensor = torch.empty(
++            output_size,
++            dtype=input_tensor.dtype,
++            device=input_tensor.device,
++        )
++        dist.all_gather_into_tensor(
++            output_tensor, input_tensor, group=comm_handle.device_group
++        )
++        return output_tensor
++
++    def _all_gather_direct(
++        self,
++        comm_handle: NCCLCommHandle,
++        input_tensor: torch.Tensor,
++        world_size: int,
++        stream: Any,
++    ) -> torch.Tensor:
++        """直接调用 NCCL C API 的 AllGather"""
++        from vllm.distributed.device_communicators.pynccl_wrapper import (
++            buffer_type,
++            cudaStream_t,
++            ncclDataTypeEnum,
++        )
++
++        assert input_tensor.device == comm_handle.device
++
++        input_size = list(input_tensor.shape)
++        output_size = [input_size[0] * world_size] + input_size[1:]
++        output_tensor = torch.empty(
++            output_size,
++            dtype=input_tensor.dtype,
++            device=input_tensor.device,
++        )
++
++        if stream is None:
++            stream = torch.cuda.current_stream(comm_handle.device)
++
++        comm_handle.nccl_lib.ncclAllGather(
++            buffer_type(input_tensor.data_ptr()),
++            buffer_type(output_tensor.data_ptr()),
++            input_tensor.numel(),
++            ncclDataTypeEnum.from_torch(input_tensor.dtype),
++            comm_handle.nccl_comm,
++            cudaStream_t(stream.cuda_stream),
++        )
++        return output_tensor
++
++    def reduce_scatter(
++        self,
++        comm_handle: NCCLCommHandle,
++        input_tensor: torch.Tensor,
++        world_size: int,
++        op: ReduceOp = ReduceOp.SUM,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """ReduceScatter: 先归约再分散。"""
++        if comm_handle.use_direct:
++            return self._reduce_scatter_direct(
++                comm_handle, input_tensor, world_size, op, stream
++            )
++
++        # Mode A: torch.distributed
++        input_size = list(input_tensor.shape)
++        assert input_size[0] % world_size == 0, (
++            f"ReduceScatter requires dim0 ({input_size[0]}) "
++            f"divisible by world_size ({world_size})"
++        )
++        output_size = [input_size[0] // world_size] + input_size[1:]
++        output_tensor = torch.empty(
++            output_size,
++            dtype=input_tensor.dtype,
++            device=input_tensor.device,
++        )
++        dist.reduce_scatter_tensor(
++            output_tensor,
++            input_tensor,
++            op=op.to_torch(),
++            group=comm_handle.device_group,
++        )
++        return output_tensor
++
++    def _reduce_scatter_direct(
++        self,
++        comm_handle: NCCLCommHandle,
++        input_tensor: torch.Tensor,
++        world_size: int,
++        op: ReduceOp,
++        stream: Any,
++    ) -> torch.Tensor:
++        """直接调用 NCCL C API 的 ReduceScatter"""
++        from vllm.distributed.device_communicators.pynccl_wrapper import (
++            buffer_type,
++            cudaStream_t,
++            ncclDataTypeEnum,
++        )
++
++        assert input_tensor.device == comm_handle.device
++        input_size = list(input_tensor.shape)
++        assert input_size[0] % world_size == 0
++
++        output_size = [input_size[0] // world_size] + input_size[1:]
++        output_tensor = torch.empty(
++            output_size,
++            dtype=input_tensor.dtype,
++            device=input_tensor.device,
++        )
++
++        if stream is None:
++            stream = torch.cuda.current_stream(comm_handle.device)
++
++        comm_handle.nccl_lib.ncclReduceScatter(
++            buffer_type(input_tensor.data_ptr()),
++            buffer_type(output_tensor.data_ptr()),
++            output_tensor.numel(),
++            ncclDataTypeEnum.from_torch(input_tensor.dtype),
++            _reduce_op_to_nccl(op),
++            comm_handle.nccl_comm,
++            cudaStream_t(stream.cuda_stream),
++        )
++        return output_tensor
++
++    def broadcast(
++        self,
++        comm_handle: NCCLCommHandle,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """Broadcast: 从 src rank 广播 tensor 到所有 rank。"""
++        if comm_handle.use_direct:
++            return self._broadcast_direct(comm_handle, tensor, src, stream)
++
++        # Mode A: torch.distributed
++        global_src = comm_handle.group_info.ranks[src]
++        output = (
++            tensor.clone() if comm_handle.group_info.rank_in_group != src else tensor
++        )
++        dist.broadcast(output, src=global_src, group=comm_handle.device_group)
++        return output
++
++    def _broadcast_direct(
++        self,
++        comm_handle: NCCLCommHandle,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any,
++    ) -> torch.Tensor:
++        """直接调用 NCCL C API 的 Broadcast"""
++        from vllm.distributed.device_communicators.pynccl_wrapper import (
++            buffer_type,
++            cudaStream_t,
++            ncclDataTypeEnum,
++        )
++
++        assert tensor.device == comm_handle.device
++
++        if stream is None:
++            stream = torch.cuda.current_stream(comm_handle.device)
++
++        rank_in_group = comm_handle.group_info.rank_in_group
++        if rank_in_group == src:
++            sendbuff = buffer_type(tensor.data_ptr())
++            recvbuff = buffer_type(tensor.data_ptr())
++        else:
++            sendbuff = buffer_type()  # NULL
++            recvbuff = buffer_type(tensor.data_ptr())
++
++        comm_handle.nccl_lib.ncclBroadcast(
++            sendbuff,
++            recvbuff,
++            tensor.numel(),
++            ncclDataTypeEnum.from_torch(tensor.dtype),
++            src,
++            comm_handle.nccl_comm,
++            cudaStream_t(stream.cuda_stream),
++        )
++        return tensor
++
++    def all_to_all(
++        self,
++        comm_handle: NCCLCommHandle,
++        input_tensor: torch.Tensor,
++        scatter_dim: int = 0,
++        gather_dim: int = 0,
++        scatter_sizes: list[int] | None = None,
++        gather_sizes: list[int] | None = None,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """All-to-All: 每个 rank 向每个 rank 发送不同块。"""
++        if comm_handle.use_direct:
++            return self._all_to_all_direct(
++                comm_handle,
++                input_tensor,
++                scatter_dim,
++                gather_dim,
++                scatter_sizes,
++                gather_sizes,
++                stream,
++            )
++
++        # Mode A: torch.distributed
++        world_size = comm_handle.group_info.world_size
++
++        if scatter_dim < 0:
++            scatter_dim += input_tensor.dim()
++        if gather_dim < 0:
++            gather_dim += input_tensor.dim()
++
++        if scatter_sizes is not None and gather_sizes is not None:
++            input_list = [
++                t.contiguous()
++                for t in torch.split(input_tensor, scatter_sizes, scatter_dim)
++            ]
++            rank = comm_handle.group_info.rank_in_group
++            output_list = []
++            tensor_shape_base = list(input_list[rank].shape)
++            for i in range(world_size):
++                tensor_shape = list(tensor_shape_base)
++                tensor_shape[gather_dim] = gather_sizes[i]
++                output_list.append(
++                    torch.empty(
++                        tensor_shape,
++                        dtype=input_tensor.dtype,
++                        device=input_tensor.device,
++                    )
++                )
++        else:
++            input_list = [
++                t.contiguous()
++                for t in torch.tensor_split(input_tensor, world_size, scatter_dim)
++            ]
++            output_list = [torch.empty_like(input_list[i]) for i in range(world_size)]
++
++        dist.all_to_all(output_list, input_list, group=comm_handle.device_group)
++        return torch.cat(output_list, dim=gather_dim).contiguous()
++
++    def _all_to_all_direct(
++        self,
++        comm_handle: NCCLCommHandle,
++        input_tensor: torch.Tensor,
++        scatter_dim: int,
++        gather_dim: int,
++        scatter_sizes: list[int] | None,
++        gather_sizes: list[int] | None,
++        stream: Any,
++    ) -> torch.Tensor:
++        """使用 ncclGroupStart/End + ncclSend/ncclRecv 实现 all_to_all。"""
++        from vllm.distributed.device_communicators.pynccl_wrapper import (
++            buffer_type,
++            cudaStream_t,
++            ncclDataTypeEnum,
++        )
++
++        assert input_tensor.device == comm_handle.device
++
++        world_size = comm_handle.group_info.world_size
++        rank = comm_handle.group_info.rank_in_group
++
++        if scatter_dim < 0:
++            scatter_dim += input_tensor.dim()
++        if gather_dim < 0:
++            gather_dim += input_tensor.dim()
++
++        if stream is None:
++            stream = torch.cuda.current_stream(comm_handle.device)
++
++        # 切分 input
++        if scatter_sizes is not None:
++            input_list = [
++                t.contiguous()
++                for t in torch.split(input_tensor, scatter_sizes, scatter_dim)
++            ]
++        else:
++            input_list = [
++                t.contiguous()
++                for t in torch.tensor_split(input_tensor, world_size, scatter_dim)
++            ]
++
++        # 准备 output buffers
++        if gather_sizes is not None:
++            tensor_shape_base = list(input_list[rank].shape)
++            output_list = []
++            for i in range(world_size):
++                tensor_shape = list(tensor_shape_base)
++                tensor_shape[gather_dim] = gather_sizes[i]
++                output_list.append(
++                    torch.empty(
++                        tensor_shape,
++                        dtype=input_tensor.dtype,
++                        device=input_tensor.device,
++                    )
++                )
++        else:
++            output_list = [torch.empty_like(input_list[i]) for i in range(world_size)]
++
++        # NCCL Group API
++        nccl_dtype = ncclDataTypeEnum.from_torch(input_tensor.dtype)
++        cuda_stream = cudaStream_t(stream.cuda_stream)
++
++        comm_handle.nccl_lib.ncclGroupStart()
++        for i in range(world_size):
++            comm_handle.nccl_lib.ncclSend(
++                buffer_type(input_list[i].data_ptr()),
++                input_list[i].numel(),
++                nccl_dtype,
++                i,
++                comm_handle.nccl_comm,
++                cuda_stream,
++            )
++            comm_handle.nccl_lib.ncclRecv(
++                buffer_type(output_list[i].data_ptr()),
++                output_list[i].numel(),
++                nccl_dtype,
++                i,
++                comm_handle.nccl_comm,
++                cuda_stream,
++            )
++        comm_handle.nccl_lib.ncclGroupEnd()
++
++        return torch.cat(output_list, dim=gather_dim).contiguous()
++
++    # ----------------------------------------------------------
++    # 点对点通信
++    # ----------------------------------------------------------
++
++    def send(
++        self,
++        comm_handle: NCCLCommHandle,
++        tensor: torch.Tensor,
++        dst: int,
++        stream: Any = None,
++    ) -> None:
++        """点对点发送。dst: 组内 rank (0-based)"""
++        if comm_handle.use_direct:
++            self._send_direct(comm_handle, tensor, dst, stream)
++            return
++
++        global_dst = comm_handle.group_info.ranks[dst]
++        dist.send(tensor, dst=global_dst, group=comm_handle.device_group)
++
++    def _send_direct(
++        self,
++        comm_handle: NCCLCommHandle,
++        tensor: torch.Tensor,
++        dst: int,
++        stream: Any,
++    ) -> None:
++        """直接调用 NCCL C API 的 Send"""
++        from vllm.distributed.device_communicators.pynccl_wrapper import (
++            buffer_type,
++            cudaStream_t,
++            ncclDataTypeEnum,
++        )
++
++        assert tensor.device == comm_handle.device
++
++        if stream is None:
++            stream = torch.cuda.current_stream(comm_handle.device)
++
++        dtype = tensor.dtype
++        if "float8" in str(dtype):
++            nccl_dtype = ncclDataTypeEnum.from_torch(torch.uint8)
++        else:
++            nccl_dtype = ncclDataTypeEnum.from_torch(dtype)
++
++        comm_handle.nccl_lib.ncclSend(
++            buffer_type(tensor.data_ptr()),
++            tensor.numel(),
++            nccl_dtype,
++            dst,
++            comm_handle.nccl_comm,
++            cudaStream_t(stream.cuda_stream),
++        )
++
++    def recv(
++        self,
++        comm_handle: NCCLCommHandle,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """点对点接收。src: 组内 rank (0-based)"""
++        if comm_handle.use_direct:
++            self._recv_direct(comm_handle, tensor, src, stream)
++            return tensor
++
++        global_src = comm_handle.group_info.ranks[src]
++        dist.recv(tensor, src=global_src, group=comm_handle.device_group)
++        return tensor
++
++    def _recv_direct(
++        self,
++        comm_handle: NCCLCommHandle,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any,
++    ) -> None:
++        """直接调用 NCCL C API 的 Recv"""
++        from vllm.distributed.device_communicators.pynccl_wrapper import (
++            buffer_type,
++            cudaStream_t,
++            ncclDataTypeEnum,
++        )
++
++        assert tensor.device == comm_handle.device
++
++        if stream is None:
++            stream = torch.cuda.current_stream(comm_handle.device)
++
++        dtype = tensor.dtype
++        if "float8" in str(dtype):
++            nccl_dtype = ncclDataTypeEnum.from_torch(torch.uint8)
++        else:
++            nccl_dtype = ncclDataTypeEnum.from_torch(dtype)
++
++        comm_handle.nccl_lib.ncclRecv(
++            buffer_type(tensor.data_ptr()),
++            tensor.numel(),
++            nccl_dtype,
++            src,
++            comm_handle.nccl_comm,
++            cudaStream_t(stream.cuda_stream),
++        )
++
++    # ----------------------------------------------------------
++    # 同步
++    # ----------------------------------------------------------
++
++    def barrier(self, comm_handle: NCCLCommHandle) -> None:
++        """组内同步屏障"""
++        dist.barrier(group=comm_handle.device_group)
++
++    def synchronize(self, stream: Any = None) -> None:
++        """同步 CUDA stream 上的所有操作。"""
++        if stream is not None:
++            stream.synchronize()
++        else:
++            torch.cuda.synchronize()
++
++    # ----------------------------------------------------------
++    # 高级功能：NCCL Group API (仅 Mode B)
++    # ----------------------------------------------------------
++
++    def group_start(self, comm_handle: NCCLCommHandle) -> None:
++        """开始一个 NCCL group 操作。"""
++        if not comm_handle.use_direct:
++            raise RuntimeError(
++                "group_start/group_end only available in direct C API mode."
++            )
++        comm_handle.nccl_lib.ncclGroupStart()
++
++    def group_end(self, comm_handle: NCCLCommHandle) -> None:
++        """结束一个 NCCL group 操作。"""
++        if not comm_handle.use_direct:
++            raise RuntimeError(
++                "group_start/group_end only available in direct C API mode."
++            )
++        comm_handle.nccl_lib.ncclGroupEnd()
++
++    def batch_send_recv(
++        self,
++        comm_handle: NCCLCommHandle,
++        send_list: list[tuple[torch.Tensor, int]],
++        recv_list: list[tuple[torch.Tensor, int]],
++        stream: Any = None,
++    ) -> None:
++        """
++        批量 Send/Recv 操作（使用 NCCL Group API）。
++
++        Args:
++            send_list: [(tensor, dst_rank), ...]
++            recv_list: [(tensor, src_rank), ...]
++            stream: 可选 CUDA stream
++        """
++        if not comm_handle.use_direct:
++            # Mode A fallback: 逐个调用
++            for tensor, dst in send_list:
++                self.send(comm_handle, tensor, dst, stream)
++            for tensor, src in recv_list:
++                self.recv(comm_handle, tensor, src, stream)
++            return
++
++        from vllm.distributed.device_communicators.pynccl_wrapper import (
++            buffer_type,
++            cudaStream_t,
++            ncclDataTypeEnum,
++        )
++
++        if stream is None:
++            stream = torch.cuda.current_stream(comm_handle.device)
++
++        cuda_stream = cudaStream_t(stream.cuda_stream)
++
++        comm_handle.nccl_lib.ncclGroupStart()
++
++        for tensor, dst in send_list:
++            assert tensor.device == comm_handle.device
++            dtype = tensor.dtype
++            if "float8" in str(dtype):
++                nccl_dtype = ncclDataTypeEnum.from_torch(torch.uint8)
++            else:
++                nccl_dtype = ncclDataTypeEnum.from_torch(dtype)
++            comm_handle.nccl_lib.ncclSend(
++                buffer_type(tensor.data_ptr()),
++                tensor.numel(),
++                nccl_dtype,
++                dst,
++                comm_handle.nccl_comm,
++                cuda_stream,
++            )
++
++        for tensor, src in recv_list:
++            assert tensor.device == comm_handle.device
++            dtype = tensor.dtype
++            if "float8" in str(dtype):
++                nccl_dtype = ncclDataTypeEnum.from_torch(torch.uint8)
++            else:
++                nccl_dtype = ncclDataTypeEnum.from_torch(dtype)
++            comm_handle.nccl_lib.ncclRecv(
++                buffer_type(tensor.data_ptr()),
++                tensor.numel(),
++                nccl_dtype,
++                src,
++                comm_handle.nccl_comm,
++                cuda_stream,
++            )
++
++        comm_handle.nccl_lib.ncclGroupEnd()
+diff --git a/vllm/distributed/unified_comm/collective.py b/vllm/distributed/unified_comm/collective.py
+new file mode 100644
+index 000000000..7d9614f67
+--- /dev/null
++++ b/vllm/distributed/unified_comm/collective.py
+@@ -0,0 +1,739 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Layer 2: ``CollectiveOps`` - device-agnostic collective layer.
++
++Builds on top of :class:`CommBackend` to provide device-independent
++collective operations and to manage communication-group lifecycles.
++
++Design principles:
++  - ``CollectiveGroup`` owns the state and operations of one group.
++  - ``CollectiveOps`` provides stateless composite primitives.
++  - Both synchronous and asynchronous modes are supported.
++  - Before issuing a collective the strategy layer is consulted to
++    pick the actual execution path.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import logging
++from typing import Any
++
++import torch
++
++from vllm.distributed.unified_comm.backend import (
++    CommBackend,
++    CommConfig,
++    CommGroupInfo,
++    ReduceOp,
++    get_available_backend,
++    get_backend,
++)
++from vllm.distributed.unified_comm.strategy import (
++    CommAlgorithm,
++    CommContext,
++    CommDecision,
++    CommPattern,
++    CommStrategy,
++    TopologyInfo,
++)
++
++logger = logging.getLogger(__name__)
++
++
++# ============================================================
++# CollectiveGroup - 通信组封装
++# ============================================================
++
++
++class CollectiveGroup:
++    """
++    统一通信组：封装了一个通信组的完整生命周期和操作。
++
++    相当于现有 GroupCoordinator 的设备无关替代品。
++
++    Usage:
++        group = CollectiveGroup.create(
++            ranks=[0, 1, 2, 3],
++            local_rank=0,
++            device=torch.device("cuda:0"),
++            backend_name="nccl",  # 或 "hccl", "metax_ccl"
++        )
++
++        result = group.all_reduce(tensor)
++        group.barrier()
++        group.destroy()
++    """
++
++    def __init__(
++        self,
++        backend: CommBackend,
++        group_info: CommGroupInfo,
++        comm_handle: Any,
++        config: CommConfig,
++        strategy: CommStrategy | None = None,
++        topology: TopologyInfo | None = None,
++    ):
++        self._backend = backend
++        self._group_info = group_info
++        self._comm_handle = comm_handle
++        self._config = config
++        self._destroyed = False
++        # 策略层接入
++        self._strategy = strategy
++        self._topology = topology or self._detect_topology()
++        self._strategy_enabled = strategy is not None
++        # OPT #1: 决策缓存 — key=(pattern, size_bucket, dtype) → CommDecision
++        self._decision_cache: dict[tuple, CommDecision] = {}
++        # OPT #5: 缓存 _is_intra_node() (它只依赖 ranks/topology, 不会变)
++        self._cached_is_intra_node: bool | None = None
++        # OPT #2: 小 tensor fast-path 阈值 (字节)
++        self._small_msg_threshold: int = 256 * 1024
++
++    # ----------------------------------------------------------
++    # 工厂方法
++    # ----------------------------------------------------------
++
++    @classmethod
++    def create(
++        cls,
++        ranks: list[int],
++        local_rank: int,
++        device: torch.device,
++        backend_name: str | None = None,
++        config: CommConfig | None = None,
++        strategy: CommStrategy | None = None,
++        topology: TopologyInfo | None = None,
++        existing_device_group: Any = None,
++        existing_cpu_group: Any = None,
++    ) -> CollectiveGroup:
++        """
++        创建通信组。
++
++        Args:
++            ranks: 参与通信的全局 rank 列表
++            local_rank: 当前进程的全局 rank
++            device: 绑定设备
++            backend_name: 后端名称。如果不指定，根据 device.type 自动选择
++            config: 后端配置
++            strategy: 通信策略。传入则在每次通信前咨询策略层。
++            topology: 硬件拓扑信息。None 则自动探测。
++            existing_device_group: 已有的 device ProcessGroup（避免重复创建）
++            existing_cpu_group: 已有的 CPU ProcessGroup（避免重复创建）
++
++        Returns:
++            初始化完毕的 CollectiveGroup
++        """
++        config = config or CommConfig()
++
++        # 将已有 PG 传递给后端，避免重复创建
++        if existing_device_group is not None:
++            config.extra["existing_device_group"] = existing_device_group
++        if existing_cpu_group is not None:
++            config.extra["existing_cpu_group"] = existing_cpu_group
++
++        # 自动选择后端
++        if backend_name:
++            backend = get_backend(backend_name)
++        else:
++            backend = get_available_backend(device.type)
++
++        # 构造组信息
++        rank_in_group = ranks.index(local_rank)
++        group_info = CommGroupInfo(
++            ranks=ranks,
++            rank_in_group=rank_in_group,
++            world_size=len(ranks),
++            device=device,
++            backend_name=backend.name,
++        )
++
++        # 初始化通信组
++        comm_handle = backend.init_comm_group(group_info, config)
++
++        # 若未传入策略，尝试获取全局策略
++        if strategy is None:
++            try:
++                from vllm.distributed.unified_comm.initialize import get_strategy
++
++                strategy = get_strategy()
++            except Exception:
++                pass
++
++        return cls(
++            backend=backend,
++            group_info=group_info,
++            comm_handle=comm_handle,
++            config=config,
++            strategy=strategy,
++            topology=topology,
++        )
++
++    # ----------------------------------------------------------
++    # 属性
++    # ----------------------------------------------------------
++
++    @property
++    def rank(self) -> int:
++        """当前进程在组内的 rank"""
++        return self._group_info.rank_in_group
++
++    @property
++    def world_size(self) -> int:
++        """组内进程数"""
++        return self._group_info.world_size
++
++    @property
++    def device(self) -> torch.device:
++        """绑定设备"""
++        return self._group_info.device
++
++    @property
++    def backend_name(self) -> str:
++        """使用的后端名称"""
++        return self._backend.name
++
++    @property
++    def ranks(self) -> list[int]:
++        """组内全局 rank 列表"""
++        return self._group_info.ranks
++
++    # ----------------------------------------------------------
++    # 集合通信操作（策略驱动）
++    # ----------------------------------------------------------
++
++    def all_reduce(
++        self,
++        tensor: torch.Tensor,
++        op: ReduceOp = ReduceOp.SUM,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        AllReduce — 策略驱动版本。
++
++        根据策略决策选择：
++        - DIRECT / RING / TREE: 直接单次 AllReduce（由后端库选择算法）
++        - BUCKET: 分桶 AllReduce，每桶独立通信（大数据量优化）
++
++        OPT #2: 小 tensor 跳过策略层, 直接走 backend.
++        """
++        self._check_alive()
++
++        # OPT #2: small-tensor fast-path
++        if tensor.nelement() * tensor.element_size() < self._small_msg_threshold:
++            return self._backend.all_reduce(self._comm_handle, tensor, op, stream)
++
++        # 咨询策略层
++        decision = self._consult_strategy(CommPattern.ALL_REDUCE, tensor)
++
++        if (
++            decision
++            and decision.algorithm == CommAlgorithm.BUCKET
++            and decision.num_chunks > 1
++        ):
++            return self._all_reduce_bucketed(tensor, op, decision, stream)
++
++        # 默认路径：单次 AllReduce
++        effective_stream = self._resolve_stream(stream, decision)
++        return self._backend.all_reduce(self._comm_handle, tensor, op, effective_stream)
++
++    def all_gather(
++        self,
++        tensor: torch.Tensor,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """AllGather：收集所有进程的 tensor（策略驱动）"""
++        self._check_alive()
++        # OPT #2: small-tensor fast-path
++        if tensor.nelement() * tensor.element_size() < self._small_msg_threshold:
++            return self._backend.all_gather(
++                self._comm_handle, tensor, self.world_size, stream
++            )
++        decision = self._consult_strategy(CommPattern.ALL_GATHER, tensor)
++        effective_stream = self._resolve_stream(stream, decision)
++        return self._backend.all_gather(
++            self._comm_handle, tensor, self.world_size, effective_stream
++        )
++
++    def reduce_scatter(
++        self,
++        tensor: torch.Tensor,
++        op: ReduceOp = ReduceOp.SUM,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """ReduceScatter：归约后分散（策略驱动）"""
++        self._check_alive()
++        decision = self._consult_strategy(CommPattern.REDUCE_SCATTER, tensor)
++        effective_stream = self._resolve_stream(stream, decision)
++        return self._backend.reduce_scatter(
++            self._comm_handle, tensor, self.world_size, op, effective_stream
++        )
++
++    def broadcast(
++        self,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """Broadcast：从 src 广播（策略驱动）"""
++        self._check_alive()
++        # OPT #2: small-tensor fast-path
++        if tensor.nelement() * tensor.element_size() < self._small_msg_threshold:
++            return self._backend.broadcast(self._comm_handle, tensor, src, stream)
++        decision = self._consult_strategy(CommPattern.BROADCAST, tensor)
++
++        # 大权重广播：分桶
++        if (
++            decision
++            and decision.algorithm == CommAlgorithm.BUCKET
++            and decision.num_chunks > 1
++        ):
++            return self._broadcast_bucketed(tensor, src, decision, stream)
++
++        effective_stream = self._resolve_stream(stream, decision)
++        return self._backend.broadcast(self._comm_handle, tensor, src, effective_stream)
++
++    def all_to_all(
++        self,
++        input_tensor: torch.Tensor,
++        scatter_dim: int = 0,
++        gather_dim: int = 0,
++        scatter_sizes: list[int] | None = None,
++        gather_sizes: list[int] | None = None,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """All-to-All（策略驱动）"""
++        self._check_alive()
++        decision = self._consult_strategy(CommPattern.ALL_TO_ALL, input_tensor)
++        effective_stream = self._resolve_stream(stream, decision)
++        return self._backend.all_to_all(
++            self._comm_handle,
++            input_tensor,
++            scatter_dim,
++            gather_dim,
++            scatter_sizes,
++            gather_sizes,
++            effective_stream,
++        )
++
++    def send(
++        self,
++        tensor: torch.Tensor,
++        dst: int,
++        stream: Any = None,
++    ) -> None:
++        """点对点发送（策略驱动）"""
++        self._check_alive()
++        decision = self._consult_strategy(CommPattern.P2P_SEND_RECV, tensor)
++        effective_stream = self._resolve_stream(stream, decision)
++        self._backend.send(self._comm_handle, tensor, dst, effective_stream)
++
++    def recv(
++        self,
++        tensor: torch.Tensor,
++        src: int,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """点对点接收（策略驱动）"""
++        self._check_alive()
++        decision = self._consult_strategy(CommPattern.P2P_SEND_RECV, tensor)
++        effective_stream = self._resolve_stream(stream, decision)
++        return self._backend.recv(self._comm_handle, tensor, src, effective_stream)
++
++    def barrier(self) -> None:
++        """组内同步"""
++        self._check_alive()
++        self._backend.barrier(self._comm_handle)
++
++    # ----------------------------------------------------------
++    # 生命周期
++    # ----------------------------------------------------------
++
++    def destroy(self) -> None:
++        """销毁通信组"""
++        if not self._destroyed:
++            self._backend.destroy_comm_group(self._comm_handle)
++            self._destroyed = True
++
++    def _check_alive(self) -> None:
++        if self._destroyed:
++            raise RuntimeError("This CollectiveGroup has been destroyed")
++
++    def __del__(self):
++        self.destroy()
++
++    def __repr__(self) -> str:
++        return (
++            f"CollectiveGroup(backend={self.backend_name}, "
++            f"rank={self.rank}/{self.world_size}, "
++            f"device={self.device}, "
++            f"strategy={self._strategy.name() if self._strategy else 'none'})"
++        )
++
++    # ----------------------------------------------------------
++    # 策略层接入
++    # ----------------------------------------------------------
++
++    def _consult_strategy(
++        self,
++        pattern: CommPattern,
++        tensor: torch.Tensor,
++    ) -> CommDecision | None:
++        """
++        咨询策略层获取决策。
++
++        如果没有配置策略或策略出错，返回 None（降级为默认行为）。
++
++        OPT #1: 加 LRU-style 缓存。key 由 pattern + size-bucket + dtype 决定;
++                hit 时跳过整个 CommContext 构造和 strategy.decide() 调用。
++        OPT #4: 把 logger.debug 的 f-string 改为 lazy / isEnabledFor 守卫。
++        """
++        if not self._strategy_enabled or self._strategy is None:
++            return None
++
++        size_bytes = tensor.nelement() * tensor.element_size()
++        # size 分桶: 0=tiny(<256K), 1=small(<2M), 2=med(<64M), 3=large
++        if size_bytes < 256 * 1024:
++            size_bucket = 0
++        elif size_bytes < 2 * 1024 * 1024:
++            size_bucket = 1
++        elif size_bytes < 64 * 1024 * 1024:
++            size_bucket = 2
++        else:
++            size_bucket = 3
++        cache_key = (pattern, size_bucket, tensor.dtype)
++
++        cached = self._decision_cache.get(cache_key)
++        if cached is not None:
++            return cached
++
++        try:
++            ctx = CommContext(
++                pattern=pattern,
++                tensor_size_bytes=size_bytes,
++                world_size=self.world_size,
++                topology=self._topology,
++                is_intra_node=self._is_intra_node(),
++                dtype=tensor.dtype,
++            )
++            decision = self._strategy.decide(ctx)
++            self._decision_cache[cache_key] = decision
++            # OPT #4: 仅在 debug 开启时构造 f-string
++            if logger.isEnabledFor(logging.DEBUG):
++                logger.debug(
++                    "[Strategy] pattern=%s, size=%s, decision=%s",
++                    pattern.name,
++                    ctx.tensor_size_bytes,
++                    decision,
++                )
++            return decision
++        except Exception as e:
++            logger.warning(
++                "Strategy decision failed, falling back to default: %s",
++                e,
++            )
++            return None
++
++    def _resolve_stream(self, user_stream: Any, decision: CommDecision | None) -> Any:
++        """
++        根据策略决策解析应使用的 stream。
++
++        优先级：用户显式传入 > 策略要求高优先级 > None（使用默认 stream）
++        """
++        if user_stream is not None:
++            return user_stream
++        if decision and decision.use_high_priority_stream:
++            return self._get_high_priority_stream()
++        return None
++
++    def _get_high_priority_stream(self) -> Any:
++        """获取高优先级 stream（延迟创建）"""
++        if not hasattr(self, "_hp_stream") or self._hp_stream is None:
++            device = self._group_info.device
++            if device.type == "cuda":
++                self._hp_stream = torch.cuda.Stream(device=device, priority=-1)
++            elif device.type == "npu":
++                try:
++                    import torch_npu  # noqa: F401
++
++                    self._hp_stream = torch.npu.Stream(device=device, priority=-1)
++                except Exception:
++                    self._hp_stream = None
++            else:
++                self._hp_stream = None
++        return self._hp_stream
++
++    # ----------------------------------------------------------
++    # 策略执行器
++    # ----------------------------------------------------------
++
++    def _all_reduce_bucketed(
++        self,
++        tensor: torch.Tensor,
++        op: ReduceOp,
++        decision: CommDecision,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """
++        分桶 AllReduce：将大 tensor 切分为多块，逐块通信。
++        """
++        num_chunks = decision.num_chunks
++        flat = tensor.contiguous().view(-1)
++        chunk_size = (flat.numel() + num_chunks - 1) // num_chunks
++        effective_stream = self._resolve_stream(stream, decision)
++
++        logger.debug(
++            "[BucketedAllReduce] total_elements=%s, chunks=%s, chunk_size=%s",
++            flat.numel(),
++            num_chunks,
++            chunk_size,
++        )
++
++        # 分桶通信（chunk 是 flat 的 view，in-place 修改已生效）
++        chunks = list(flat.split(chunk_size))
++        for chunk in chunks:
++            self._backend.all_reduce(self._comm_handle, chunk, op, effective_stream)
++
++        return flat.view(tensor.shape)
++
++    def _broadcast_bucketed(
++        self,
++        tensor: torch.Tensor,
++        src: int,
++        decision: CommDecision,
++        stream: Any = None,
++    ) -> torch.Tensor:
++        """分桶 Broadcast：将大权重切分为多块逐块广播。"""
++        num_chunks = decision.num_chunks
++        flat = tensor.contiguous().view(-1)
++        chunk_size = (flat.numel() + num_chunks - 1) // num_chunks
++        effective_stream = self._resolve_stream(stream, decision)
++
++        logger.debug(
++            "[BucketedBroadcast] total_elements=%s, chunks=%s, src=%s",
++            flat.numel(),
++            num_chunks,
++            src,
++        )
++
++        chunks = list(flat.split(chunk_size))
++        for chunk in chunks:
++            self._backend.broadcast(self._comm_handle, chunk, src, effective_stream)
++
++        return flat.view(tensor.shape)
++
++    # ----------------------------------------------------------
++    # 拓扑探测
++    # ----------------------------------------------------------
++
++    def _detect_topology(self) -> TopologyInfo:
++        """自动探测硬件拓扑信息。"""
++        import os
++
++        device_type = self._group_info.device.type
++        gpus_per_node = 8  # 保守默认值
++
++        if device_type == "cuda":
++            with contextlib.suppress(Exception):
++                gpus_per_node = torch.cuda.device_count()
++        elif device_type == "npu":
++            try:
++                import torch_npu  # noqa: F401
++
++                gpus_per_node = torch.npu.device_count()
++            except Exception:
++                pass
++
++        # 检测节点数
++        num_nodes = max(1, self.world_size // gpus_per_node)
++
++        # NVSwitch 探测
++        has_nvswitch = os.environ.get("UNIFIED_COMM_HAS_NVSWITCH", "").lower() in (
++            "1",
++            "true",
++        )
++
++        if device_type == "cuda" and not has_nvswitch:
++            has_nvswitch = self._probe_nvswitch()
++
++        # RDMA 探测
++        has_rdma = os.environ.get("UNIFIED_COMM_HAS_RDMA", "").lower() in ("1", "true")
++        if not has_rdma:
++            nccl_ib = os.environ.get("NCCL_IB_DISABLE", "0")
++            if nccl_ib == "0":
++                has_rdma = self._probe_rdma()
++
++        # 带宽估计
++        intra_bw = 600.0 if has_nvswitch else 300.0
++
++        inter_bw = 100.0 if has_rdma else 25.0
++
++        return TopologyInfo(
++            num_nodes=num_nodes,
++            gpus_per_node=gpus_per_node,
++            intra_node_bandwidth_gbps=intra_bw,
++            inter_node_bandwidth_gbps=inter_bw,
++            has_nvswitch=has_nvswitch,
++            has_rdma=has_rdma,
++            device_type=device_type,
++        )
++
++    def _is_intra_node(self) -> bool:
++        """判断当前通信组是否全在同一个节点内 (OPT #5: 缓存结果)"""
++        if self._cached_is_intra_node is not None:
++            return self._cached_is_intra_node
++        gpus_per_node = self._topology.gpus_per_node
++        if self.world_size <= gpus_per_node:
++            ranks = self._group_info.ranks
++            node_ids = set(r // gpus_per_node for r in ranks)
++            result = len(node_ids) == 1
++        else:
++            result = False
++        self._cached_is_intra_node = result
++        return result
++
++    @staticmethod
++    def _probe_nvswitch() -> bool:
++        """尝试探测 NVSwitch（CUDA 环境）。"""
++        try:
++            import subprocess
++
++            result = subprocess.run(
++                ["nvidia-smi", "topo", "-m"], capture_output=True, text=True, timeout=5
++            )
++            if result.returncode == 0:
++                output = result.stdout
++                if "NV12" in output or "NV18" in output:
++                    return True
++        except Exception:
++            pass
++        return False
++
++    @staticmethod
++    def _probe_rdma() -> bool:
++        """尝试探测 RDMA 可用性。"""
++        try:
++            import os
++
++            ib_path = "/sys/class/infiniband"
++            if os.path.exists(ib_path):
++                devices = os.listdir(ib_path)
++                return len(devices) > 0
++        except Exception:
++            pass
++        return False
++
++
++# ============================================================
++# CollectiveOps - 组合通信操作（无状态工具类）
++# ============================================================
++
++
++class CollectiveOps:
++    """
++    高级集合通信操作：在 CollectiveGroup 之上提供常用组合模式。
++
++    这些是无状态函数，方便上层（如 TransferPlane、模型层）直接调用。
++    """
++
++    @staticmethod
++    def all_reduce_coalesced(
++        group: CollectiveGroup,
++        tensors: list[torch.Tensor],
++        op: ReduceOp = ReduceOp.SUM,
++    ) -> list[torch.Tensor]:
++        """
++        合并多个小 tensor 的 AllReduce（减少通信次数）。
++
++        将多个 tensor 打平合并为一个大 tensor 做 AllReduce，然后拆分回去。
++        """
++        if not tensors:
++            return []
++
++        shapes = [t.shape for t in tensors]
++        flat_tensors = [t.contiguous().view(-1) for t in tensors]
++        coalesced = torch.cat(flat_tensors, dim=0)
++
++        result = group.all_reduce(coalesced, op)
++
++        outputs = []
++        offset = 0
++        for shape in shapes:
++            numel = 1
++            for s in shape:
++                numel *= s
++            outputs.append(result[offset : offset + numel].view(shape))
++            offset += numel
++
++        return outputs
++
++    @staticmethod
++    def ring_all_reduce(
++        group: CollectiveGroup,
++        tensor: torch.Tensor,
++        op: ReduceOp = ReduceOp.SUM,
++    ) -> torch.Tensor:
++        """
++        Ring AllReduce 实现（用于后端不支持 AllReduce 时的 fallback）。
++
++        分为 reduce-scatter 和 all-gather 两步。
++        """
++        scattered = group.reduce_scatter(tensor, op)
++        result = group.all_gather(scattered)
++        return result
++
++    @staticmethod
++    def broadcast_from_rank0(
++        group: CollectiveGroup,
++        tensor: torch.Tensor,
++    ) -> torch.Tensor:
++        """从 rank 0 广播 tensor 到所有进程"""
++        return group.broadcast(tensor, src=0)
++
++    @staticmethod
++    def scatter(
++        group: CollectiveGroup,
++        tensor: torch.Tensor,
++        src: int = 0,
++        dim: int = 0,
++    ) -> torch.Tensor:
++        """
++        Scatter：将 tensor 从 src 均分到所有进程。
++
++        基于 Send/Recv 实现。
++        """
++        if group.rank == src:
++            chunks = tensor.chunk(group.world_size, dim=dim)
++            for dst_rank in range(group.world_size):
++                if dst_rank != src:
++                    group.send(chunks[dst_rank].contiguous(), dst_rank)
++            return chunks[src].contiguous()
++        else:
++            chunk_size = list(tensor.shape)
++            chunk_size[dim] = chunk_size[dim] // group.world_size
++            recv_buf = torch.empty(chunk_size, dtype=tensor.dtype, device=group.device)
++            return group.recv(recv_buf, src)
++
++    @staticmethod
++    def gather(
++        group: CollectiveGroup,
++        tensor: torch.Tensor,
++        dst: int = 0,
++        dim: int = 0,
++    ) -> torch.Tensor | None:
++        """
++        Gather：将所有进程的 tensor 收集到 dst 进程。
++
++        Returns:
++            dst 进程返回拼接后的 tensor；其他进程返回 None
++        """
++        if group.rank == dst:
++            chunks = [torch.empty_like(tensor) for _ in range(group.world_size)]
++            chunks[dst] = tensor
++            for src_rank in range(group.world_size):
++                if src_rank != dst:
++                    chunks[src_rank] = group.recv(torch.empty_like(tensor), src_rank)
++            return torch.cat(chunks, dim=dim)
++        else:
++            group.send(tensor, dst)
++            return None
+diff --git a/vllm/distributed/unified_comm/initialize.py b/vllm/distributed/unified_comm/initialize.py
+new file mode 100644
+index 000000000..74e62d0e0
+--- /dev/null
++++ b/vllm/distributed/unified_comm/initialize.py
+@@ -0,0 +1,148 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Initialization entry point for the unified communication layer.
++
++Called from vllm-hust startup code to register backends and prepare
++the communication groups.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++from vllm.distributed.unified_comm.backend import register_backend
++from vllm.distributed.unified_comm.strategy import (
++    CommStrategy,
++    DefaultStrategy,
++)
++from vllm.distributed.unified_comm.transfer_plane import (
++    ECTransferPlane,
++    KVTransferPlane,
++    TransferPlaneRegistry,
++    TransferProtocol,
++    WeightTransferPlane,
++)
++
++
++def initialize_unified_comm(
++    device_type: str | None = None,
++    strategy: CommStrategy | None = None,
++) -> None:
++    """
++    初始化统一通信层。
++
++    自动检测硬件环境，注册对应后端，初始化传输平面。
++
++    Args:
++        device_type: 强制指定设备类型。None 则自动检测。
++        strategy: 自定义策略。None 则使用 DefaultStrategy。
++
++    Usage:
++        # 自动检测环境
++        initialize_unified_comm()
++
++        # 强制使用 HCCL
++        initialize_unified_comm(device_type="npu")
++
++        # 使用自定义策略
++        initialize_unified_comm(strategy=ConfigDrivenStrategy(my_config))
++    """
++    # 1. 自动检测设备类型
++    if device_type is None:
++        device_type = _detect_device_type()
++
++    # 2. 注册后端
++    _register_backends(device_type)
++
++    # 3. 注册传输平面
++    _register_transfer_planes()
++
++    # 4. 设置默认策略
++    global _global_strategy
++    _global_strategy = strategy or DefaultStrategy()
++
++
++def _detect_device_type() -> str:
++    """自动检测当前可用的设备类型"""
++    # 优先检测 NPU
++    try:
++        import torch_npu  # noqa: F401
++
++        if torch.npu.is_available():
++            return "npu"
++    except ImportError:
++        pass
++
++    # 检测 CUDA
++    if torch.cuda.is_available():
++        return "cuda"
++
++    # Fallback: CPU
++    return "cpu"
++
++
++def _register_backends(device_type: str) -> None:
++    """根据设备类型注册对应后端"""
++    if device_type == "npu":
++        try:
++            from vllm.distributed.unified_comm.backends.hccl_backend import (
++                HCCLBackend,
++            )
++
++            # 通过环境变量 UNIFIED_COMM_USE_DIRECT_HCCL=1 启用 Mode B
++            # (直接调 libhccl.so C API, 低延迟; 默认 Mode A 走 torch.distributed)
++            use_direct = os.environ.get(
++                "UNIFIED_COMM_USE_DIRECT_HCCL", "0"
++            ).lower() in ("1", "true", "yes")
++            register_backend(HCCLBackend(use_direct_hccl=use_direct))
++        except ImportError:
++            pass
++
++    elif device_type == "cuda":
++        from vllm.distributed.unified_comm.backends.nccl_backend import (
++            NCCLBackend,
++        )
++
++        use_direct = _should_use_direct_nccl()
++        register_backend(NCCLBackend(use_direct_nccl=use_direct))
++
++    # 始终注册 Gloo 作为 CPU 通信的 fallback（如需要可在此扩展）
++
++
++def _should_use_direct_nccl() -> bool:
++    """
++    判断是否应该使用直接 NCCL C API 模式。
++
++    通过环境变量 UNIFIED_COMM_USE_DIRECT_NCCL 控制：
++      - "1" / "true": 启用直接模式 (Mode B)
++      - "0" / "false" / 未设置: 使用 torch.distributed 模式 (Mode A)
++    """
++    val = os.environ.get("UNIFIED_COMM_USE_DIRECT_NCCL", "0").lower()
++    return val in ("1", "true", "yes")
++
++
++def _register_transfer_planes() -> None:
++    """注册默认传输平面"""
++    registry = TransferPlaneRegistry()
++    registry.register(KVTransferPlane(preferred_protocol=TransferProtocol.P2P))
++    registry.register(
++        WeightTransferPlane(preferred_protocol=TransferProtocol.COLLECTIVE)
++    )
++    registry.register(ECTransferPlane(preferred_protocol=TransferProtocol.COLLECTIVE))
++
++
++# 全局策略实例
++_global_strategy: CommStrategy = DefaultStrategy()
++
++
++def get_strategy() -> CommStrategy:
++    """获取全局通信策略"""
++    return _global_strategy
++
++
++def set_strategy(strategy: CommStrategy) -> None:
++    """设置全局通信策略"""
++    global _global_strategy
++    _global_strategy = strategy
+diff --git a/vllm/distributed/unified_comm/strategy.py b/vllm/distributed/unified_comm/strategy.py
+new file mode 100644
+index 000000000..963480100
+--- /dev/null
++++ b/vllm/distributed/unified_comm/strategy.py
+@@ -0,0 +1,377 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Layer 4: ``CommStrategy`` - communication strategy layer.
++
++Picks the optimal algorithm and transport link based on runtime
++context (hardware topology, message size, communication pattern).
++
++Design principles:
++  - Strategy is decoupled from execution: it only makes decisions and
++    never performs communication itself.
++  - Both rule-driven and config-driven modes are supported.
++  - Extensible: callers may register custom strategies.
++"""
++
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from dataclasses import dataclass, field
++from enum import Enum, auto
++from typing import Any
++
++import torch
++
++from vllm.distributed.unified_comm.types import TransferProtocol
++
++# ============================================================
++# 策略上下文（输入）
++# ============================================================
++
++
++class CommPattern(Enum):
++    """通信模式"""
++
++    ALL_REDUCE = auto()
++    ALL_GATHER = auto()
++    REDUCE_SCATTER = auto()
++    BROADCAST = auto()
++    ALL_TO_ALL = auto()
++    P2P_SEND_RECV = auto()
++    KV_TRANSFER = auto()
++    WEIGHT_SYNC = auto()
++    EC_DISPATCH = auto()
++
++
++@dataclass
++class TopologyInfo:
++    """硬件拓扑信息"""
++
++    num_nodes: int = 1  # 节点数
++    gpus_per_node: int = 8  # 每节点加速器数
++    intra_node_bandwidth_gbps: float = 600.0  # 节点内带宽 (GB/s)
++    inter_node_bandwidth_gbps: float = 100.0  # 节点间带宽 (GB/s)
++    has_nvswitch: bool = False  # 是否有 NVSwitch / HCCS
++    has_rdma: bool = False  # 是否支持 RDMA
++    device_type: str = "cuda"  # 设备类型
++
++
++@dataclass
++class CommContext:
++    """
++    通信策略的决策上下文。
++
++    策略层根据这些信息做出算法和链路选择。
++    """
++
++    pattern: CommPattern  # 通信模式
++    tensor_size_bytes: int  # 数据量（字节）
++    world_size: int  # 参与通信的进程数
++    topology: TopologyInfo  # 硬件拓扑
++    is_intra_node: bool = True  # 是否节点内通信
++    dtype: torch.dtype = torch.float16  # 数据类型
++    urgency: str = "normal"  # 优先级：high / normal / low
++    extra: dict[str, Any] = field(default_factory=dict)
++
++
++# ============================================================
++# 策略决策（输出）
++# ============================================================
++
++
++class CommAlgorithm(Enum):
++    """通信算法"""
++
++    # AllReduce 算法
++    RING = auto()  # Ring AllReduce
++    TREE = auto()  # Tree AllReduce
++    RECURSIVE_HALVING = auto()  # 递归减半
++    DIRECT = auto()  # 直接通信（小数据量）
++    BUCKET = auto()  # 分桶通信
++
++    # 传输协议选择
++    COLLECTIVE_BASED = auto()  # 基于集合通信
++    P2P_BASED = auto()  # 基于点对点
++    RDMA_BASED = auto()  # 基于 RDMA
++    SHM_BASED = auto()  # 基于共享内存
++
++    # 特殊
++    AUTO = auto()  # 让后端自动选择
++
++
++@dataclass
++class CommDecision:
++    """
++    策略层的决策结果。
++
++    上层按此决策执行通信。
++    """
++
++    algorithm: CommAlgorithm  # 选定的算法
++    protocol: TransferProtocol  # 选定的传输协议
++    use_high_priority_stream: bool = False  # 是否使用高优先级流
++    num_chunks: int = 1  # 分块数（用于分桶/流水线）
++    overlap_compute: bool = False  # 是否与计算重叠
++    compression: str | None = None  # 压缩方式（如 "fp16", "int8"）
++    backend_hint: str | None = None  # 推荐的后端名称
++    extra: dict[str, Any] = field(default_factory=dict)
++
++    def __repr__(self) -> str:
++        return (
++            f"CommDecision(algo={self.algorithm.name}, "
++            f"proto={self.protocol.name}, "
++            f"chunks={self.num_chunks}, "
++            f"overlap={self.overlap_compute})"
++        )
++
++
++# ============================================================
++# CommStrategy 抽象基类
++# ============================================================
++
++
++class CommStrategy(ABC):
++    """
++    通信策略抽象基类。
++
++    不同策略实现可以基于规则、配置文件、或运行时 profiling。
++
++    Usage:
++        strategy = DefaultStrategy()
++        ctx = CommContext(
++            pattern=CommPattern.ALL_REDUCE,
++            tensor_size_bytes=1024*1024,
++            world_size=8,
++            topology=TopologyInfo(gpus_per_node=8),
++        )
++        decision = strategy.decide(ctx)
++    """
++
++    @abstractmethod
++    def decide(self, context: CommContext) -> CommDecision:
++        """
++        根据上下文做出通信策略决策。
++
++        Args:
++            context: 通信上下文信息
++
++        Returns:
++            CommDecision: 策略决策结果
++        """
++        ...
++
++    @abstractmethod
++    def name(self) -> str:
++        """策略名称"""
++        ...
++
++
++# ============================================================
++# 默认策略实现
++# ============================================================
++
++
++class DefaultStrategy(CommStrategy):
++    """
++    默认通信策略：基于简单规则的启发式选择。
++
++    规则：
++    - 小数据量（< 256KB）：直接通信
++    - 中等数据量：Ring 算法
++    - 大数据量 + NVSwitch：Tree 算法
++    - 跨节点：分桶 + 流水线
++    - KV Transfer：优先 P2P，有 RDMA 则用 RDMA
++    - EC Dispatch：All-to-All（底层 backend 自选算法）
++    """
++
++    # 阈值配置（可外部覆盖）
++    SMALL_MSG_THRESHOLD = 256 * 1024  # 256 KB
++    LARGE_MSG_THRESHOLD = 64 * 1024 * 1024  # 64 MB
++    BUCKET_SIZE = 25 * 1024 * 1024  # 25 MB per bucket
++
++    def name(self) -> str:
++        return "default"
++
++    def decide(self, context: CommContext) -> CommDecision:
++        pattern = context.pattern
++
++        # ---- KV Transfer ----
++        if pattern == CommPattern.KV_TRANSFER:
++            return self._decide_kv_transfer(context)
++
++        # ---- EC Dispatch (MoE All-to-All) ----
++        if pattern == CommPattern.EC_DISPATCH:
++            return self._decide_ec_dispatch(context)
++
++        # ---- Weight Sync ----
++        if pattern == CommPattern.WEIGHT_SYNC:
++            return self._decide_weight_sync(context)
++
++        # ---- 集合通信模式 ----
++        return self._decide_collective(context)
++
++    def _decide_collective(self, context: CommContext) -> CommDecision:
++        """集合通信策略选择"""
++        size = context.tensor_size_bytes
++        topo = context.topology
++
++        # 小数据量：直接通信
++        if size < self.SMALL_MSG_THRESHOLD:
++            return CommDecision(
++                algorithm=CommAlgorithm.DIRECT,
++                protocol=TransferProtocol.COLLECTIVE,
++            )
++
++        # 有 NVSwitch/HCCS 且节点内：Tree 算法
++        if context.is_intra_node and topo.has_nvswitch:
++            return CommDecision(
++                algorithm=CommAlgorithm.TREE,
++                protocol=TransferProtocol.COLLECTIVE,
++            )
++
++        # 大数据量跨节点：分桶 + 流水线
++        if size > self.LARGE_MSG_THRESHOLD and not context.is_intra_node:
++            num_chunks = max(1, size // self.BUCKET_SIZE)
++            return CommDecision(
++                algorithm=CommAlgorithm.BUCKET,
++                protocol=TransferProtocol.COLLECTIVE,
++                num_chunks=num_chunks,
++                overlap_compute=True,
++            )
++
++        # 默认：Ring 算法
++        return CommDecision(
++            algorithm=CommAlgorithm.RING,
++            protocol=TransferProtocol.COLLECTIVE,
++        )
++
++    def _decide_kv_transfer(self, context: CommContext) -> CommDecision:
++        """KV Cache 传输策略"""
++        topo = context.topology
++
++        # 有 RDMA：优先 RDMA
++        if topo.has_rdma and not context.is_intra_node:
++            return CommDecision(
++                algorithm=CommAlgorithm.RDMA_BASED,
++                protocol=TransferProtocol.RDMA,
++                use_high_priority_stream=True,
++            )
++
++        # 节点内：共享内存
++        if context.is_intra_node:
++            return CommDecision(
++                algorithm=CommAlgorithm.SHM_BASED,
++                protocol=TransferProtocol.SHM,
++            )
++
++        # 默认：P2P
++        return CommDecision(
++            algorithm=CommAlgorithm.P2P_BASED,
++            protocol=TransferProtocol.P2P,
++            use_high_priority_stream=True,
++        )
++
++    def _decide_ec_dispatch(self, context: CommContext) -> CommDecision:
++        """MoE Expert-Centric dispatch 策略"""
++        return CommDecision(
++            algorithm=CommAlgorithm.AUTO,
++            protocol=TransferProtocol.COLLECTIVE,
++            overlap_compute=context.urgency == "high",
++        )
++
++    def _decide_weight_sync(self, context: CommContext) -> CommDecision:
++        """权重同步策略"""
++        size = context.tensor_size_bytes
++
++        # 大模型权重：分桶广播
++        if size > self.LARGE_MSG_THRESHOLD:
++            num_chunks = max(1, size // self.BUCKET_SIZE)
++            return CommDecision(
++                algorithm=CommAlgorithm.BUCKET,
++                protocol=TransferProtocol.COLLECTIVE,
++                num_chunks=num_chunks,
++            )
++
++        # 小权重：直接广播
++        return CommDecision(
++            algorithm=CommAlgorithm.DIRECT,
++            protocol=TransferProtocol.COLLECTIVE,
++        )
++
++
++# ============================================================
++# 配置驱动策略
++# ============================================================
++
++
++class ConfigDrivenStrategy(CommStrategy):
++    """
++    配置驱动策略：从配置文件/字典读取策略规则。
++
++    适用于用户需要精细控制通信行为的场景。
++
++    Config 格式示例:
++        {
++            "all_reduce": {
++                "small_threshold_bytes": 262144,
++                "algorithm": "ring",
++                "overlap_compute": false
++            },
++            "kv_transfer": {
++                "protocol": "rdma",
++                "high_priority": true
++            }
++        }
++    """
++
++    def __init__(self, config: dict[str, Any]):
++        self._config = config
++
++    def name(self) -> str:
++        return "config_driven"
++
++    def decide(self, context: CommContext) -> CommDecision:
++        """根据配置做决策"""
++        pattern_key = context.pattern.name.lower()
++        pattern_config = self._config.get(pattern_key, {})
++
++        algorithm_str = pattern_config.get("algorithm", "auto")
++        protocol_str = pattern_config.get("protocol", "collective")
++
++        algorithm = self._parse_algorithm(algorithm_str)
++        protocol = self._parse_protocol(protocol_str)
++
++        return CommDecision(
++            algorithm=algorithm,
++            protocol=protocol,
++            use_high_priority_stream=pattern_config.get("high_priority", False),
++            num_chunks=pattern_config.get("num_chunks", 1),
++            overlap_compute=pattern_config.get("overlap_compute", False),
++            compression=pattern_config.get("compression"),
++            backend_hint=pattern_config.get("backend"),
++        )
++
++    @staticmethod
++    def _parse_algorithm(s: str) -> CommAlgorithm:
++        mapping = {
++            "ring": CommAlgorithm.RING,
++            "tree": CommAlgorithm.TREE,
++            "recursive_halving": CommAlgorithm.RECURSIVE_HALVING,
++            "direct": CommAlgorithm.DIRECT,
++            "bucket": CommAlgorithm.BUCKET,
++            "auto": CommAlgorithm.AUTO,
++            "p2p": CommAlgorithm.P2P_BASED,
++            "rdma": CommAlgorithm.RDMA_BASED,
++            "shm": CommAlgorithm.SHM_BASED,
++        }
++        return mapping.get(s.lower(), CommAlgorithm.AUTO)
++
++    @staticmethod
++    def _parse_protocol(s: str) -> TransferProtocol:
++        mapping = {
++            "collective": TransferProtocol.COLLECTIVE,
++            "p2p": TransferProtocol.P2P,
++            "rdma": TransferProtocol.RDMA,
++            "shm": TransferProtocol.SHM,
++            "store": TransferProtocol.STORE,
++        }
++        return mapping.get(s.lower(), TransferProtocol.COLLECTIVE)
+diff --git a/vllm/distributed/unified_comm/transfer_plane.py b/vllm/distributed/unified_comm/transfer_plane.py
+new file mode 100644
+index 000000000..437ccdc66
+--- /dev/null
++++ b/vllm/distributed/unified_comm/transfer_plane.py
+@@ -0,0 +1,464 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Layer 3: ``TransferPlane`` - data-transfer abstraction.
++
++Sits above the collective layer and provides a unified transfer
++abstraction for the different kinds of data movement that vLLM
++performs (KV cache, EC, weight transfer).
++
++Design principles:
++  - One ``TransferPlane`` implementation per transfer type.
++  - The plane hides whether the transfer is backed by RDMA, shared
++    memory, or a collective operation.
++  - Planes are managed by a registry and may be registered at runtime.
++  - The strategy layer is consulted before each transfer to choose
++    the protocol and tuning knobs.
++"""
++
++from __future__ import annotations
++
++import logging
++import time
++from abc import ABC, abstractmethod
++from dataclasses import dataclass, field
++from typing import Any
++
++import torch
++
++from vllm.distributed.unified_comm.collective import CollectiveGroup
++from vllm.distributed.unified_comm.types import TransferProtocol, TransferType
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class TransferMetadata:
++    """传输元数据，描述一次传输的上下文"""
++
++    transfer_type: TransferType
++    src_rank: int
++    dst_ranks: list[int]
++    tensor_shape: tuple[int, ...]
++    tensor_dtype: torch.dtype
++    layer_id: int | None = None  # 用于 KV Cache：第几层
++    sequence_id: int | None = None  # 用于 KV Cache：哪个序列
++    expert_id: int | None = None  # 用于 EC：哪个专家
++    tags: dict[str, Any] = field(default_factory=dict)  # 扩展字段
++
++
++@dataclass
++class TransferResult:
++    """传输结果"""
++
++    success: bool
++    tensor: torch.Tensor | None = None  # 接收到的 tensor（接收方有效）
++    error: str | None = None
++    latency_ms: float | None = None  # 传输延迟（用于性能分析）
++
++
++# ============================================================
++# TransferPlane 抽象基类
++# ============================================================
++
++
++class TransferPlane(ABC):
++    """
++    传输平面抽象基类。
++
++    每种数据传输模式实现一个 TransferPlane，隐藏底层传输协议细节。
++
++    Usage:
++        # KV Cache 传输示例
++        kv_plane = KVTransferPlane(group, protocol=TransferProtocol.P2P)
++
++        # 发送方（prefill worker）
++        kv_plane.send(kv_tensor, metadata)
++
++        # 接收方（decode worker）
++        result = kv_plane.recv(metadata)
++        decoded_kv = result.tensor
++    """
++
++    @property
++    @abstractmethod
++    def transfer_type(self) -> TransferType:
++        """此平面处理的传输类型"""
++        ...
++
++    @property
++    @abstractmethod
++    def protocol(self) -> TransferProtocol:
++        """底层使用的传输协议"""
++        ...
++
++    @abstractmethod
++    def initialize(self, group: CollectiveGroup, **kwargs) -> None:
++        """
++        初始化传输平面。
++
++        Args:
++            group: 底层通信组
++            **kwargs: 平面特有的初始化参数
++        """
++        ...
++
++    @abstractmethod
++    def send(
++        self,
++        tensor: torch.Tensor,
++        metadata: TransferMetadata,
++    ) -> TransferResult:
++        """
++        发送 tensor。
++
++        Args:
++            tensor: 要发送的数据
++            metadata: 传输元数据（描述发给谁、是什么数据等）
++
++        Returns:
++            TransferResult（发送方通常只关心 success）
++        """
++        ...
++
++    @abstractmethod
++    def recv(
++        self,
++        metadata: TransferMetadata,
++    ) -> TransferResult:
++        """
++        接收 tensor。
++
++        Args:
++            metadata: 传输元数据（描述从哪里接收、期望什么形状等）
++
++        Returns:
++            TransferResult（包含接收到的 tensor）
++        """
++        ...
++
++    @abstractmethod
++    def send_async(
++        self,
++        tensor: torch.Tensor,
++        metadata: TransferMetadata,
++    ) -> TransferHandle:
++        """异步发送，返回句柄用于后续等待"""
++        ...
++
++    @abstractmethod
++    def recv_async(
++        self,
++        metadata: TransferMetadata,
++    ) -> TransferHandle:
++        """异步接收，返回句柄用于后续等待"""
++        ...
++
++    def shutdown(self) -> None:
++        """关闭传输平面，释放资源 (default: no-op)."""
++        return None
++
++
++# ============================================================
++# TransferHandle - 异步操作句柄
++# ============================================================
++
++
++class TransferHandle:
++    """
++    异步传输操作的句柄。
++
++    用于等待异步传输完成并获取结果。
++    """
++
++    def __init__(self, future: Any = None):
++        self._future = future
++        self._result: TransferResult | None = None
++
++    def wait(self, timeout: float | None = None) -> TransferResult:
++        """等待操作完成"""
++        if self._result is not None:
++            return self._result
++        raise NotImplementedError("Subclass must implement wait()")
++
++    def is_done(self) -> bool:
++        """检查是否已完成"""
++        return self._result is not None
++
++
++# ============================================================
++# 具体传输平面实现
++# ============================================================
++
++
++class KVTransferPlane(TransferPlane):
++    """
++    KV Cache 传输平面。
++
++    用于 prefill-decode 分离部署场景下的 KV Cache 迁移。
++    支持 P2P 和 RDMA 两种协议。
++    """
++
++    def __init__(self, preferred_protocol: TransferProtocol = TransferProtocol.P2P):
++        self._preferred_protocol = preferred_protocol
++        self._group: CollectiveGroup | None = None
++        self._initialized = False
++
++    @property
++    def transfer_type(self) -> TransferType:
++        return TransferType.KV_CACHE
++
++    @property
++    def protocol(self) -> TransferProtocol:
++        return self._preferred_protocol
++
++    def initialize(self, group: CollectiveGroup, **kwargs) -> None:
++        self._group = group
++        self._initialized = True
++
++    def send(
++        self,
++        tensor: torch.Tensor,
++        metadata: TransferMetadata,
++    ) -> TransferResult:
++        """发送 KV Cache tensor 到目标 decode worker"""
++        assert self._initialized, "KVTransferPlane not initialized"
++        assert self._group is not None
++
++        start_time = time.perf_counter()
++
++        try:
++            for dst in metadata.dst_ranks:
++                self._group.send(tensor.contiguous(), dst)
++
++            latency_ms = (time.perf_counter() - start_time) * 1000
++            return TransferResult(success=True, latency_ms=latency_ms)
++        except Exception as e:
++            return TransferResult(success=False, error=str(e))
++
++    def recv(
++        self,
++        metadata: TransferMetadata,
++    ) -> TransferResult:
++        """从 prefill worker 接收 KV Cache tensor"""
++        assert self._initialized, "KVTransferPlane not initialized"
++        assert self._group is not None
++
++        start_time = time.perf_counter()
++
++        recv_buf = torch.empty(
++            metadata.tensor_shape,
++            dtype=metadata.tensor_dtype,
++            device=self._group.device,
++        )
++
++        try:
++            result_tensor = self._group.recv(recv_buf, metadata.src_rank)
++            latency_ms = (time.perf_counter() - start_time) * 1000
++            return TransferResult(
++                success=True, tensor=result_tensor, latency_ms=latency_ms
++            )
++        except Exception as e:
++            return TransferResult(success=False, error=str(e))
++
++    def send_async(
++        self, tensor: torch.Tensor, metadata: TransferMetadata
++    ) -> TransferHandle:
++        result = self.send(tensor, metadata)
++        handle = TransferHandle()
++        handle._result = result
++        return handle
++
++    def recv_async(self, metadata: TransferMetadata) -> TransferHandle:
++        result = self.recv(metadata)
++        handle = TransferHandle()
++        handle._result = result
++        return handle
++
++
++class WeightTransferPlane(TransferPlane):
++    """
++    模型权重传输平面。
++
++    用于模型加载时的权重分发、热更新时的权重同步。
++    """
++
++    def __init__(
++        self,
++        preferred_protocol: TransferProtocol = TransferProtocol.COLLECTIVE,
++    ):
++        self._preferred_protocol = preferred_protocol
++        self._group: CollectiveGroup | None = None
++        self._initialized = False
++
++    @property
++    def transfer_type(self) -> TransferType:
++        return TransferType.WEIGHT
++
++    @property
++    def protocol(self) -> TransferProtocol:
++        return self._preferred_protocol
++
++    def initialize(self, group: CollectiveGroup, **kwargs) -> None:
++        self._group = group
++        self._initialized = True
++
++    def send(self, tensor: torch.Tensor, metadata: TransferMetadata) -> TransferResult:
++        """广播权重（大权重自动分桶）"""
++        assert self._initialized and self._group is not None
++
++        start_time = time.perf_counter()
++
++        try:
++            result_tensor = self._group.broadcast(tensor, src=metadata.src_rank)
++            latency_ms = (time.perf_counter() - start_time) * 1000
++            return TransferResult(
++                success=True, tensor=result_tensor, latency_ms=latency_ms
++            )
++        except Exception as e:
++            return TransferResult(success=False, error=str(e))
++
++    def recv(self, metadata: TransferMetadata) -> TransferResult:
++        """接收广播的权重（broadcast 模式下 send 和 recv 合一）"""
++        assert self._group is not None
++        return self.send(
++            torch.empty(
++                metadata.tensor_shape,
++                dtype=metadata.tensor_dtype,
++                device=self._group.device,
++            ),
++            metadata,
++        )
++
++    def send_async(
++        self, tensor: torch.Tensor, metadata: TransferMetadata
++    ) -> TransferHandle:
++        result = self.send(tensor, metadata)
++        handle = TransferHandle()
++        handle._result = result
++        return handle
++
++    def recv_async(self, metadata: TransferMetadata) -> TransferHandle:
++        result = self.recv(metadata)
++        handle = TransferHandle()
++        handle._result = result
++        return handle
++
++
++class ECTransferPlane(TransferPlane):
++    """
++    Expert-Centric 传输平面。
++
++    用于 MoE 模型中 token 到 expert 的路由和回传。
++    底层通常基于 All-to-All。
++    """
++
++    def __init__(
++        self,
++        preferred_protocol: TransferProtocol = TransferProtocol.COLLECTIVE,
++    ):
++        self._preferred_protocol = preferred_protocol
++        self._group: CollectiveGroup | None = None
++        self._initialized = False
++
++    @property
++    def transfer_type(self) -> TransferType:
++        return TransferType.EC
++
++    @property
++    def protocol(self) -> TransferProtocol:
++        return self._preferred_protocol
++
++    def initialize(self, group: CollectiveGroup, **kwargs) -> None:
++        self._group = group
++        self._initialized = True
++
++    def send(self, tensor: torch.Tensor, metadata: TransferMetadata) -> TransferResult:
++        """All-to-All 发送（MoE dispatch）"""
++        assert self._initialized and self._group is not None
++
++        start_time = time.perf_counter()
++
++        try:
++            scatter_sizes = metadata.tags.get("scatter_sizes")
++            gather_sizes = metadata.tags.get("gather_sizes")
++            result_tensor = self._group.all_to_all(
++                tensor,
++                scatter_dim=metadata.tags.get("scatter_dim", 0),
++                gather_dim=metadata.tags.get("gather_dim", 0),
++                scatter_sizes=scatter_sizes,
++                gather_sizes=gather_sizes,
++            )
++            latency_ms = (time.perf_counter() - start_time) * 1000
++            return TransferResult(
++                success=True, tensor=result_tensor, latency_ms=latency_ms
++            )
++        except Exception as e:
++            return TransferResult(success=False, error=str(e))
++
++    def recv(self, metadata: TransferMetadata) -> TransferResult:
++        """EC 模式下 send 和 recv 通过 All-to-All 同时完成"""
++        raise NotImplementedError(
++            "ECTransferPlane uses all_to_all which is symmetric. Use send() instead."
++        )
++
++    def send_async(
++        self, tensor: torch.Tensor, metadata: TransferMetadata
++    ) -> TransferHandle:
++        result = self.send(tensor, metadata)
++        handle = TransferHandle()
++        handle._result = result
++        return handle
++
++    def recv_async(self, metadata: TransferMetadata) -> TransferHandle:
++        raise NotImplementedError("Use send_async for EC (all-to-all is symmetric)")
++
++
++# ============================================================
++# TransferPlane 注册表
++# ============================================================
++
++
++class TransferPlaneRegistry:
++    """
++    传输平面注册表：管理所有已注册的传输平面实例。
++
++    Usage:
++        registry = TransferPlaneRegistry()
++        registry.register(KVTransferPlane())
++        registry.register(WeightTransferPlane())
++
++        kv_plane = registry.get(TransferType.KV_CACHE)
++    """
++
++    _instance: TransferPlaneRegistry | None = None
++    _planes: dict[TransferType, TransferPlane]
++
++    def __new__(cls) -> TransferPlaneRegistry:
++        if cls._instance is None:
++            cls._instance = super().__new__(cls)
++            cls._instance._planes = {}
++        return cls._instance
++
++    def register(self, plane: TransferPlane) -> None:
++        """注册传输平面"""
++        self._planes[plane.transfer_type] = plane
++
++    def get(self, transfer_type: TransferType) -> TransferPlane:
++        """获取传输平面"""
++        if transfer_type not in self._planes:
++            available = [t.name for t in self._planes]
++            raise KeyError(
++                f"TransferPlane for {transfer_type.name} not registered. "
++                f"Available: {available}"
++            )
++        return self._planes[transfer_type]
++
++    def list_planes(self) -> list[TransferType]:
++        """列出已注册的传输类型"""
++        return list(self._planes.keys())
++
++    def shutdown_all(self) -> None:
++        """关闭所有传输平面"""
++        for plane in self._planes.values():
++            plane.shutdown()
++        self._planes.clear()
+diff --git a/vllm/distributed/unified_comm/types.py b/vllm/distributed/unified_comm/types.py
+new file mode 100644
+index 000000000..a0ad347b5
+--- /dev/null
++++ b/vllm/distributed/unified_comm/types.py
+@@ -0,0 +1,32 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Common type definitions shared by the unified_comm subpackage.
++
++This module deliberately avoids importing any other ``unified_comm``
++submodule so that it can be referenced from anywhere without creating
++circular imports.
++"""
++
++from __future__ import annotations
++
++from enum import Enum, auto
++
++
++class TransferProtocol(Enum):
++    """Underlying transport protocol."""
++
++    COLLECTIVE = auto()  # backed by collectives (AllGather / AllReduce)
++    P2P = auto()  # point-to-point (Send / Recv)
++    RDMA = auto()  # raw RDMA
++    SHM = auto()  # shared memory
++    STORE = auto()  # via a Store (e.g. torch.distributed.Store)
++
++
++class TransferType(Enum):
++    """Logical transfer plane type."""
++
++    KV_CACHE = auto()  # KV cache transfer (prefill -> decode disagg)
++    EC = auto()  # Expert-Centric transfer (MoE multi-plane)
++    WEIGHT = auto()  # weight transfer (load / sync / hot-update)
++    ACTIVATION = auto()  # intermediate activation (pipeline parallel)
++    CUSTOM = auto()  # user-defined transfer
+-- 
+2.53.0.windows.3
+
