@@ -1,0 +1,36 @@
+{
+  "canonical_repository": "https://github.com/vLLM-HUST/vllm-hust-unified-comm",
+  "display_name": "Unified Communication",
+  "evidence": {
+    "index": "README.md",
+    "latest_result": "https://github.com/vLLM-HUST/vllm-hust-unified-comm",
+    "performance_claims": [],
+    "qualification": "unqualified"
+  },
+  "lifecycle": {
+    "activation_contract": "See the extension manifest and README; installation or discovery alone does not enable this MOD.",
+    "default_enabled": false,
+    "rollback_contract": "Disable or remove the MOD and return to the unmodified host path.",
+    "status": "incubating"
+  },
+  "mod_id": "unified-communication-migration",
+  "repository": "vllm-hust-unified-comm",
+  "repository_type": "mod",
+  "responsibility": {
+    "advisor_status": "unknown",
+    "advisors": [],
+    "maintainers": [
+      {
+        "github": "machuanhu",
+        "name": "machuanhu"
+      }
+    ],
+    "organization": "vLLM-HUST"
+  },
+  "schema_version": "vllm-hust-mod-metadata-v1",
+  "scope": {
+    "mechanism": "communication_runtime",
+    "out_of_scope": [],
+    "supported_workloads": []
+  }
+}
