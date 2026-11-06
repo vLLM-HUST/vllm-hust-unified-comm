@@ -1,0 +1,51 @@
+{
+  "schema": "vllm-hust-unified-comm-mount-smoke/v1",
+  "date": "2026-11-07",
+  "classification": "two-rank-hccl-collective-mount-smoke-not-serving-or-performance-qualification",
+  "source": {
+    "mod_base_commit": "4069e64e68bfa332841aa0c9bc5400f716edba20",
+    "host_provider_tested_commit": "40a4fbc0559c8939c6a0d39311a88192c3488bea",
+    "mod_version": "0.2.0.dev0"
+  },
+  "environment": {
+    "device": "Ascend 910B2",
+    "device_count_allocated": 4,
+    "device_count_used": 2,
+    "driver_and_npu_smi_version": "26.0.rc1",
+    "python": "3.12.13",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0.post4"
+  },
+  "activation": {
+    "environment": {
+      "VLLM_HUST_COMMUNICATION_PROVIDER": "vllm_hust_unified_comm.provider.UnifiedCommunicationProvider"
+    },
+    "loader": "vllm.distributed.communication_provider.load_communication_provider",
+    "process_group_owner": "host",
+    "provider_creates_or_destroys_process_group": false
+  },
+  "command": "PYTHONPATH=src:/root/work/vllm-hust-unified-host VLLM_PLUGINS=none VLLM_HUST_COMMUNICATION_PROVIDER=vllm_hust_unified_comm.provider.UnifiedCommunicationProvider python -m torch.distributed.run --nproc-per-node 2 scripts/hccl_mount_smoke.py",
+  "result": {
+    "backend": "hccl",
+    "collectives": {
+      "all_gather": "PASS",
+      "all_reduce": "PASS",
+      "broadcast": "PASS",
+      "reduce_scatter": "PASS"
+    },
+    "provider": "UnifiedCommunicationProvider",
+    "status": "PASS",
+    "world_size": 2
+  },
+  "cleanup": {
+    "provider_destroy_did_not_destroy_host_communicator": true,
+    "remaining_mount_smoke_processes": 0,
+    "remaining_npu_processes": 0
+  },
+  "limitations": [
+    "No model was loaded and no vLLM serving request was issued.",
+    "No throughput, latency, memory, or performance comparison was measured.",
+    "No NCCL/CUDA hardware run was performed.",
+    "Collective failure injection is covered by CPU contract tests, not by deliberately breaking the live HCCL group."
+  ]
+}
