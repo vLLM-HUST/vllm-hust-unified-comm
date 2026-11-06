@@ -1,10 +1,19 @@
 # Unified Communication for vLLM-HUST
 
-Owner-led migration carrier for the device-neutral communication runtime. The target is an independent library plus a narrow vLLM Host Provider, not an import-time scheduler plugin.
+Organization-maintained migration carrier for the device-neutral communication
+runtime. The target is an independent library plus a narrow vLLM Host Provider,
+not an import-time scheduler plugin.
 
-**Status: device-neutral contracts, registry, and decision policies are installable and tested; vLLM collective delegation remains blocked until the host contracts in `HOST_CONTRACT.md` exist.**
+**Status: device-neutral contracts, registry, and decision policies are
+installable and tested. Host collective delegation and the Ascend HCCL adapter
+are implemented in [vllm-hust#74](https://github.com/vLLM-HUST/vllm-hust/pull/74)
+and [vllm-ascend-hust#71](https://github.com/vLLM-HUST/vllm-ascend-hust/pull/71).
+The extension remains `import_only` until those changes merge and hardware
+validation is recorded.**
 
-Technical ownership belongs to @machuanhu. Source extraction must preserve exact authorship, license, tests, constraints, and evidence before activation is considered.
+Technical ownership belongs to @ShuhaoZhangTony on behalf of vLLM-HUST. Source
+extraction preserves original authorship, license, tests, constraints, and
+evidence before activation is considered.
 
 See [MAINTAINERS.md](MAINTAINERS.md) and [PROVENANCE.md](PROVENANCE.md).
 
