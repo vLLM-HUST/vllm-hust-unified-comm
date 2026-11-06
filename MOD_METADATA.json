@@ -3,15 +3,15 @@
   "display_name": "Unified Communication",
   "evidence": {
     "index": "README.md",
-    "latest_result": "https://github.com/vLLM-HUST/vllm-hust-unified-comm",
+    "latest_result": "evidence/hccl-mount-smoke-20261107.json",
     "performance_claims": [],
-    "qualification": "unqualified"
+    "qualification": "mount-smoke-only"
   },
   "lifecycle": {
     "activation_contract": "See the extension manifest and README; installation or discovery alone does not enable this MOD.",
     "default_enabled": false,
     "rollback_contract": "Disable or remove the MOD and return to the unmodified host path.",
-    "status": "incubating"
+    "status": "validating"
   },
   "mod_id": "unified-communication-migration",
   "repository": "vllm-hust-unified-comm",
