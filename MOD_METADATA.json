@@ -3,9 +3,9 @@
   "display_name": "Unified Communication",
   "evidence": {
     "index": "README.md",
-    "latest_result": "evidence/hccl-mount-smoke-20261107.json",
+    "latest_result": "evidence/model-serving-smoke-20261107.json",
     "performance_claims": [],
-    "qualification": "mount-smoke-only"
+    "qualification": "model-serving-smoke"
   },
   "lifecycle": {
     "activation_contract": "See the extension manifest and README; installation or discovery alone does not enable this MOD.",

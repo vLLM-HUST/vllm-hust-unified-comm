@@ -1,0 +1,91 @@
+{
+  "schema": "vllm-hust-unified-comm-model-serving-smoke/v1",
+  "date": "2026-11-07",
+  "classification": "two-rank-hccl-model-serving-correctness-smoke-not-performance-qualification",
+  "source": {
+    "mod_merged_commit": "5dd61585910d3109b258cf25f846adf4ba337c5b",
+    "mod_provider_blob": "144cce056b290b4fa5fa3c652ac1c53db3b38045",
+    "host_runtime_base_commit": "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665",
+    "host_lazy_provider_fix": "vLLM-HUST/vllm-hust#75",
+    "vllm_ascend_commit": "1cdb8c4db6e50f36f1fb3283b3e3dd618f6821e8"
+  },
+  "environment": {
+    "device": "Ascend 910B2",
+    "device_count_allocated": 4,
+    "device_count_used": 2,
+    "driver_and_npu_smi_version": "26.0.rc1",
+    "cann": "9.1.0",
+    "python": "3.12.13",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0.post4",
+    "vllm": "0.23.0",
+    "vllm_ascend": "0.23.0.post1",
+    "model": "/data/shared_models/Qwen3-0.6B",
+    "model_architecture": "Qwen3ForCausalLM"
+  },
+  "activation": {
+    "environment": {
+      "VLLM_HUST_COMMUNICATION_PROVIDER": "vllm_hust_unified_comm.provider.UnifiedCommunicationProvider"
+    },
+    "tensor_parallel_size": 2,
+    "pipeline_parallel_size": 1,
+    "backend": "hccl",
+    "enforce_eager": true,
+    "max_model_len": 256,
+    "max_num_seqs": 1,
+    "gpu_memory_utilization": 0.2,
+    "provider_load_observation": {
+      "group": "tp:0",
+      "rank_0": "PASS",
+      "rank_1": "PASS"
+    }
+  },
+  "command": "PYTHONPATH=/path/to/vllm-hust-unified-comm/src:/path/to/vllm-hust:$PYTHONPATH VLLM_PLUGINS=ascend VLLM_HUST_COMMUNICATION_PROVIDER=vllm_hust_unified_comm.provider.UnifiedCommunicationProvider python -m vllm.entrypoints.cli.main serve /data/shared_models/Qwen3-0.6B --served-model-name unified-comm-smoke --tensor-parallel-size 2 --distributed-executor-backend mp --enforce-eager --max-model-len 256 --max-num-seqs 1 --gpu-memory-utilization 0.20 --host 127.0.0.1 --port 18080",
+  "result": {
+    "engine_startup": "PASS",
+    "health_http_status": 200,
+    "models_http_status": 200,
+    "models_contains_served_name": true,
+    "chat_completions": {
+      "http_status": 200,
+      "prompt_tokens": 16,
+      "completion_tokens": 32,
+      "generated_nonempty_text": true
+    },
+    "completions": {
+      "http_status": 200,
+      "prompt_tokens": 9,
+      "completion_tokens": 8,
+      "generated_nonempty_text": true,
+      "observed_prefix": " 4. The result of 2"
+    },
+    "status": "PASS"
+  },
+  "cleanup": {
+    "shutdown_signal": "SIGINT",
+    "vllm_force_killed_remaining_process_count": 1,
+    "resource_tracker_reported_semaphore_or_shared_memory_cleanup": true,
+    "remaining_server_processes": 0,
+    "remaining_npu_processes": 0,
+    "tracked_by": "vLLM-HUST/vllm-hust#54"
+  },
+  "compatibility_findings": [
+    {
+      "host_source_commit": "40a4fbc0559c8939c6a0d39311a88192c3488bea",
+      "adapter_source_commit": "2a071ec8b55627fda4386a1ed1da074bf66dfbe6",
+      "result": "INCOMPATIBLE_BEFORE_PROVIDER_INITIALIZATION",
+      "detail": "vLLM Ascend patch_kv_cache_utils imported _approximate_gcd, which was absent from this host source commit"
+    },
+    {
+      "result": "FIXED_BY_HOST_PR_75",
+      "detail": "Out-of-tree GroupCoordinator subclasses that replace __init__ require lazy provider initialization; groups without a device communicator must skip provider loading"
+    }
+  ],
+  "limitations": [
+    "This was a focused correctness smoke with two requests, not a load test.",
+    "No throughput, latency, goodput, memory-efficiency, or native-path comparison is claimed.",
+    "No CUDA/NCCL hardware run was performed.",
+    "No live HCCL failure was injected.",
+    "The shutdown warning remains tracked separately even though post-run process and NPU cleanup were complete."
+  ]
+}
