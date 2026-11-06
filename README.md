@@ -6,9 +6,9 @@ not an import-time scheduler plugin.
 
 **Status: device-neutral contracts, registry, and decision policies are
 installable and tested. Host collective delegation and the Ascend HCCL adapter
-are implemented in [vllm-hust#74](https://github.com/vLLM-HUST/vllm-hust/pull/74)
-and [vllm-ascend-hust#71](https://github.com/vLLM-HUST/vllm-ascend-hust/pull/71).
-The extension remains `import_only` until those changes merge and hardware
+are merged in [vllm-hust#74](https://github.com/vLLM-HUST/vllm-hust/pull/74)
+(`8ec6ac0`) and [vllm-ascend-hust#71](https://github.com/vLLM-HUST/vllm-ascend-hust/pull/71)
+(`591d40b`). The extension remains `import_only` until multi-device hardware
 validation is recorded.**
 
 Technical ownership belongs to @ShuhaoZhangTony on behalf of vLLM-HUST. Source
@@ -23,8 +23,8 @@ Extension ID: `org.vllm-hust.unified-communication`
 
 This repository follows the vLLM-HUST Extension Template. The current package
 is deliberately `import_only`: the host-independent library can be imported and
-tested, but Extension Manager must refuse enablement until GroupCoordinator
-delegation, backend packages, and hardware compatibility evidence land.
+tested, but Extension Manager must refuse enablement until backend packages
+and multi-device hardware compatibility evidence land.
 
 ```bash
 python -m pip install "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@main"
