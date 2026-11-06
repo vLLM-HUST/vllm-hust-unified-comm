@@ -62,6 +62,18 @@ VLLM_HUST_COMMUNICATION_PROVIDER=vllm_hust_unified_comm.provider.UnifiedCommunic
 This validates provider loading and four HCCL collectives. It is not a model
 serving or performance qualification.
 
+A subsequent two-device serving smoke loaded Qwen3-0.6B with tensor parallel
+size 2, logged `UnifiedCommunicationProvider` on both HCCL workers, and returned
+HTTP 200 with generated tokens from both Chat Completions and Completions. See
+[`evidence/model-serving-smoke-20261107.json`](evidence/model-serving-smoke-20261107.json).
+This is correctness evidence, not a throughput or latency claim.
+
+The validated serving matrix is vLLM `0.23.0` plus the communication-provider
+host seam and lazy adapter compatibility fix, vLLM Ascend `0.23.0.post1`, Python
+3.12, CANN 9.1, and Ascend 910B2. When running from source, prepend the host and
+MOD paths to the existing `PYTHONPATH`; do not replace the existing CANN Python
+paths. Newer host/adapter combinations require their own compatibility check.
+
 The static Manifest 0.3 descriptor lives inside the Python distribution under
 `src/`. Installation alone changes no vLLM behavior.
 
