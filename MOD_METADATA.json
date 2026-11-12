@@ -17,12 +17,17 @@
   "repository": "vllm-hust-unified-comm",
   "repository_type": "mod",
   "responsibility": {
-    "advisor_status": "unknown",
-    "advisors": [],
+    "advisor_status": "declared",
+    "advisors": [
+      {
+        "name": "Xiong Wang / 王雄",
+        "relationship": "internal"
+      }
+    ],
     "maintainers": [
       {
-        "github": "ShuhaoZhangTony",
-        "name": "ShuhaoZhangTony"
+        "github": "machuanhu",
+        "name": "马川湖"
       }
     ],
     "organization": "vLLM-HUST"

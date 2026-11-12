@@ -13,9 +13,10 @@ provider carrier is now mountable for validation through the host seam;
 production qualification still requires model-serving, performance-regression,
 and CUDA/NCCL evidence.**
 
-Technical ownership belongs to @ShuhaoZhangTony on behalf of vLLM-HUST. Source
-extraction preserves original authorship, license, tests, constraints, and
-evidence before activation is considered.
+The responsible maintainer is Ma Chuanhu (@machuanhu), advised by Xiong Wang
+(王雄). Shuhao Zhang provided integration assistance; that assistance does not
+transfer project ownership or the advising relationship. Source extraction
+preserves original authorship, license, tests, constraints, and evidence.
 
 See [MAINTAINERS.md](MAINTAINERS.md) and [PROVENANCE.md](PROVENANCE.md).
 
