@@ -1,6 +1,6 @@
 # Unified Communication for vLLM-HUST
 
-Organization-maintained migration carrier for the device-neutral communication
+Owner-maintained migration carrier for the device-neutral communication
 runtime. The target is an independent library plus a narrow vLLM Host Provider,
 not an import-time scheduler plugin.
 
